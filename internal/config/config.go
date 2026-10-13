@@ -1,0 +1,65 @@
+package config
+
+import (
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Config represents runtime configuration for the Fenrir Daemon.
+type Config struct {
+	// ServerPort is the HTTP port the daemon listens on (default: 8080).
+	ServerPort string
+
+	// DockerHost is the target Docker daemon URL (e.g. "unix:///var/run/docker.sock" or "tcp://linux-box:2375").
+	// If empty, the official Docker client defaults to standard local/environment conventions.
+	DockerHost string
+
+	// MetricsCacheTTL is the duration to cache host metrics to avoid frequent scraping overhead.
+	MetricsCacheTTL time.Duration
+
+	// GameFilterKeywords are substring matches against image names or container names to flag game servers.
+	GameFilterKeywords []string
+
+	// AllowedOrigins is the CORS allowed origins list (default: "*").
+	AllowedOrigins []string
+}
+
+// Load reads configuration from environment variables with fallback defaults.
+func Load() *Config {
+	port := getEnv("FENRIR_PORT", "8080")
+	if !strings.HasPrefix(port, ":") && !strings.Contains(port, ":") {
+		port = ":" + port
+	}
+
+	rawTTL := getEnv("FENRIR_METRICS_CACHE_TTL_SEC", "2")
+	ttlSec, err := strconv.Atoi(rawTTL)
+	if err != nil || ttlSec < 1 {
+		ttlSec = 2
+	}
+
+	keywordsRaw := getEnv("FENRIR_GAME_KEYWORDS", "minecraft,mc,itzg,paper,purpur,forge,fabric,spigot,bedrock,valheim")
+	var keywords []string
+	for _, kw := range strings.Split(keywordsRaw, ",") {
+		kw = strings.TrimSpace(strings.ToLower(kw))
+		if kw != "" {
+			keywords = append(keywords, kw)
+		}
+	}
+
+	return &Config{
+		ServerPort:         port,
+		DockerHost:         getEnv("DOCKER_HOST", ""),
+		MetricsCacheTTL:    time.Duration(ttlSec) * time.Second,
+		GameFilterKeywords: keywords,
+		AllowedOrigins:     strings.Split(getEnv("FENRIR_CORS_ORIGINS", "*"), ","),
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
