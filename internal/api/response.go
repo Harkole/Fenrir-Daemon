@@ -29,3 +29,14 @@ func writeError(w http.ResponseWriter, status int, message string) {
 		Error:   message,
 	})
 }
+
+func writeErrorWithData(w http.ResponseWriter, status int, message string, data any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(APIResponse{
+		Success: false,
+		Error:   message,
+		Data:    data,
+	})
+}
+

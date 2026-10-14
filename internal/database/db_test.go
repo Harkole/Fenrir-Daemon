@@ -257,3 +257,139 @@ func TestAPIKeyValidation(t *testing.T) {
 		t.Errorf("expected revoked key to be invalid")
 	}
 }
+
+func TestProjectsCRUD(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	p := &model.Project{
+		Name:          "atm10",
+		DirectoryPath: "/var/lib/fenrir/stacks/atm10",
+		ComposeFile:   "compose.yml",
+		Description:   "ATM10 Minecraft Server",
+		Status:        "created",
+	}
+
+	// 1. Create project
+	if err := db.CreateProject(ctx, p); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	if p.ID == 0 {
+		t.Errorf("expected non-zero ID")
+	}
+
+	// 2. Get project
+	fetched, err := db.GetProject(ctx, "atm10")
+	if err != nil {
+		t.Fatalf("failed to get project: %v", err)
+	}
+	if fetched.Name != "atm10" || fetched.DirectoryPath != "/var/lib/fenrir/stacks/atm10" {
+		t.Errorf("unexpected project fetched: %+v", fetched)
+	}
+
+	// 3. Update status
+	if err := db.UpdateProjectStatus(ctx, "atm10", "running"); err != nil {
+		t.Fatalf("failed to update project status: %v", err)
+	}
+	fetched, _ = db.GetProject(ctx, "atm10")
+	if fetched.Status != "running" {
+		t.Errorf("expected status 'running', got %q", fetched.Status)
+	}
+
+	// 4. List projects
+	list, err := db.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("failed to list projects: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 project in list, got %d", len(list))
+	}
+
+	// 5. Delete project
+	if err := db.DeleteProject(ctx, "atm10"); err != nil {
+		t.Fatalf("failed to delete project: %v", err)
+	}
+	_, err = db.GetProject(ctx, "atm10")
+	if err == nil {
+		t.Fatalf("expected error after project deletion, got nil")
+	}
+}
+
+func TestArchivesCRUD(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	archive := &model.ArchiveMetadata{
+		ProjectName: "atm10",
+		ArchivePath: "/var/lib/fenrir/archives/atm10-20261014.zip",
+		SizeBytes:   1024 * 1024 * 50, // 50MB
+		CreatedAt:   now,
+		ExpiresAt:   now.Add(90 * 24 * time.Hour),
+	}
+
+	// 1. Create archive
+	if err := db.CreateArchive(ctx, archive); err != nil {
+		t.Fatalf("failed to create archive: %v", err)
+	}
+	if archive.ID == 0 {
+		t.Errorf("expected non-zero ID")
+	}
+	if archive.DaysUntilDeletion <= 0 {
+		t.Errorf("expected positive days until deletion, got %d", archive.DaysUntilDeletion)
+	}
+
+	// 2. Get archive
+	fetched, err := db.GetArchive(ctx, archive.ID)
+	if err != nil {
+		t.Fatalf("failed to get archive: %v", err)
+	}
+	if fetched.ProjectName != "atm10" || fetched.SizeBytes != 1024*1024*50 {
+		t.Errorf("unexpected archive fetched: %+v", fetched)
+	}
+
+	// 3. List archives
+	list, err := db.ListArchives(ctx, "")
+	if err != nil {
+		t.Fatalf("failed to list all archives: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 archive in list, got %d", len(list))
+	}
+
+	projList, err := db.ListArchives(ctx, "atm10")
+	if err != nil {
+		t.Fatalf("failed to list atm10 archives: %v", err)
+	}
+	if len(projList) != 1 {
+		t.Fatalf("expected 1 archive for atm10, got %d", len(projList))
+	}
+
+	// 4. Query expired archives (currently none expired)
+	expiredNone, err := db.GetExpiredArchives(ctx, now)
+	if err != nil {
+		t.Fatalf("failed to query expired: %v", err)
+	}
+	if len(expiredNone) != 0 {
+		t.Errorf("expected 0 expired archives now, got %d", len(expiredNone))
+	}
+
+	// In future +91 days, it should be expired
+	expiredFuture, err := db.GetExpiredArchives(ctx, now.Add(91*24*time.Hour))
+	if err != nil {
+		t.Fatalf("failed to query expired in future: %v", err)
+	}
+	if len(expiredFuture) != 1 {
+		t.Errorf("expected 1 expired archive in future, got %d", len(expiredFuture))
+	}
+
+	// 5. Delete archive
+	if err := db.DeleteArchive(ctx, archive.ID); err != nil {
+		t.Fatalf("failed to delete archive: %v", err)
+	}
+	_, err = db.GetArchive(ctx, archive.ID)
+	if err == nil {
+		t.Fatalf("expected error getting deleted archive, got nil")
+	}
+}
+

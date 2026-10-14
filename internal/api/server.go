@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Harkole/fenrir-daemon/internal/compose"
 	"github.com/Harkole/fenrir-daemon/internal/config"
 	"github.com/Harkole/fenrir-daemon/internal/database"
 	"github.com/Harkole/fenrir-daemon/internal/docker"
@@ -19,8 +20,8 @@ type Server struct {
 }
 
 // NewServer builds and configures a new HTTP Server instance.
-func NewServer(cfg *config.Config, dm *docker.Monitor, hc *metrics.HostCollector, db *database.DB, version string) *Server {
-	h := NewHandler(dm, hc, db, version)
+func NewServer(cfg *config.Config, dm *docker.Monitor, hc *metrics.HostCollector, db *database.DB, ce *compose.Engine, version string) *Server {
+	h := NewHandler(dm, hc, db, ce, cfg, version)
 	auth := APIKeyAuthMiddleware(cfg, db)
 
 	mux := http.NewServeMux()
@@ -52,6 +53,25 @@ func NewServer(cfg *config.Config, dm *docker.Monitor, hc *metrics.HostCollector
 	mux.Handle("POST /api/v1/containers/{name}/stop", auth(http.HandlerFunc(h.HandleContainerStop)))
 	mux.Handle("POST /api/v1/containers/{name}/restart", auth(http.HandlerFunc(h.HandleContainerRestart)))
 
+	// 6. Docker Compose Stack Management endpoints
+	mux.HandleFunc("GET /api/v1/projects", h.HandleListProjects)
+	mux.Handle("POST /api/v1/projects", auth(http.HandlerFunc(h.HandleCreateProject)))
+	mux.HandleFunc("GET /api/v1/projects/{name}", h.HandleGetProject)
+	mux.HandleFunc("GET /api/v1/projects/{name}/compose", h.HandleGetProjectCompose)
+	mux.Handle("PUT /api/v1/projects/{name}/compose", auth(http.HandlerFunc(h.HandleUpdateProjectCompose)))
+	mux.Handle("POST /api/v1/projects/{name}/up", auth(http.HandlerFunc(h.HandleProjectUp)))
+	mux.Handle("POST /api/v1/projects/{name}/down", auth(http.HandlerFunc(h.HandleProjectDown)))
+	mux.Handle("POST /api/v1/projects/{name}/restart", auth(http.HandlerFunc(h.HandleProjectRestart)))
+	mux.HandleFunc("GET /api/v1/projects/{name}/status", h.HandleProjectStatus)
+	mux.HandleFunc("GET /api/v1/projects/{name}/logs", h.HandleProjectLogs)
+	mux.Handle("DELETE /api/v1/projects/{name}", auth(http.HandlerFunc(h.HandleDeleteProject)))
+
+	// 7. 90-Day Rolling Archive & Restore endpoints
+	mux.HandleFunc("GET /api/v1/archives", h.HandleListArchives)
+	mux.HandleFunc("GET /api/v1/projects/{name}/archives", h.HandleGetProjectArchives)
+	mux.Handle("POST /api/v1/archives/{id}/restore", auth(http.HandlerFunc(h.HandleRestoreArchive)))
+	mux.Handle("DELETE /api/v1/archives/{id}", auth(http.HandlerFunc(h.HandleDeleteArchive)))
+
 	// Apply middleware stack: Recovery -> CORS -> Logging -> Mux
 	var rootHandler http.Handler = mux
 	rootHandler = CORSMiddleware(cfg.AllowedOrigins)(rootHandler)
@@ -62,7 +82,7 @@ func NewServer(cfg *config.Config, dm *docker.Monitor, hc *metrics.HostCollector
 		Addr:         cfg.ServerPort,
 		Handler:      rootHandler,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 45 * time.Second, // Allow sufficient time for container graceful stop/restart
+		WriteTimeout: 45 * time.Second, // Allow sufficient time for container/stack operations
 		IdleTimeout:  60 * time.Second,
 	}
 

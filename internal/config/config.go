@@ -33,6 +33,15 @@ type Config struct {
 
 	// MetricsCollectionInterval is the frequency to sample and record container metrics history.
 	MetricsCollectionInterval time.Duration
+
+	// StacksDir is the isolated root directory where Docker Compose stacks are provisioned (default: "/var/lib/fenrir/stacks/").
+	StacksDir string
+
+	// ArchivesDir is the directory where rolling backup archives are stored (default: "/var/lib/fenrir/archives/").
+	ArchivesDir string
+
+	// ArchiveRetentionDays is the duration in days to retain stack backup archives before automatic pruning (default: 90).
+	ArchiveRetentionDays int
 }
 
 // Load reads configuration from environment variables with fallback defaults.
@@ -63,6 +72,12 @@ func Load() *Config {
 		intervalSec = 30
 	}
 
+	rawRetention := getEnv("FENRIR_ARCHIVE_RETENTION_DAYS", "90")
+	retentionDays, err := strconv.Atoi(rawRetention)
+	if err != nil || retentionDays < 1 {
+		retentionDays = 90
+	}
+
 	return &Config{
 		ServerPort:                port,
 		DockerHost:                getEnv("DOCKER_HOST", ""),
@@ -72,6 +87,9 @@ func Load() *Config {
 		DatabasePath:              getEnv("FENRIR_DB_PATH", "fenrir.db"),
 		APIKey:                    os.Getenv("FENRIR_API_KEY"),
 		MetricsCollectionInterval: time.Duration(intervalSec) * time.Second,
+		StacksDir:                 getEnv("FENRIR_STACKS_DIR", "/var/lib/fenrir/stacks/"),
+		ArchivesDir:               getEnv("FENRIR_ARCHIVES_DIR", "/var/lib/fenrir/archives/"),
+		ArchiveRetentionDays:      retentionDays,
 	}
 }
 

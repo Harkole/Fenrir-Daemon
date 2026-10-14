@@ -29,6 +29,15 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.MetricsCollectionInterval != 30*time.Second {
 		t.Errorf("expected default metrics interval 30s, got %v", cfg.MetricsCollectionInterval)
 	}
+	if cfg.StacksDir != "/var/lib/fenrir/stacks/" {
+		t.Errorf("expected default stacks dir '/var/lib/fenrir/stacks/', got %s", cfg.StacksDir)
+	}
+	if cfg.ArchivesDir != "/var/lib/fenrir/archives/" {
+		t.Errorf("expected default archives dir '/var/lib/fenrir/archives/', got %s", cfg.ArchivesDir)
+	}
+	if cfg.ArchiveRetentionDays != 90 {
+		t.Errorf("expected default retention 90 days, got %d", cfg.ArchiveRetentionDays)
+	}
 }
 
 func TestConfigCustomEnv(t *testing.T) {
@@ -39,6 +48,9 @@ func TestConfigCustomEnv(t *testing.T) {
 	os.Setenv("FENRIR_DB_PATH", "custom.db")
 	os.Setenv("FENRIR_API_KEY", "secret-test-key")
 	os.Setenv("FENRIR_METRICS_INTERVAL_SEC", "15")
+	os.Setenv("FENRIR_STACKS_DIR", "/custom/stacks/")
+	os.Setenv("FENRIR_ARCHIVES_DIR", "/custom/archives/")
+	os.Setenv("FENRIR_ARCHIVE_RETENTION_DAYS", "60")
 	defer func() {
 		os.Unsetenv("FENRIR_PORT")
 		os.Unsetenv("DOCKER_HOST")
@@ -47,6 +59,9 @@ func TestConfigCustomEnv(t *testing.T) {
 		os.Unsetenv("FENRIR_DB_PATH")
 		os.Unsetenv("FENRIR_API_KEY")
 		os.Unsetenv("FENRIR_METRICS_INTERVAL_SEC")
+		os.Unsetenv("FENRIR_STACKS_DIR")
+		os.Unsetenv("FENRIR_ARCHIVES_DIR")
+		os.Unsetenv("FENRIR_ARCHIVE_RETENTION_DAYS")
 	}()
 
 	cfg := Load()
@@ -71,5 +86,14 @@ func TestConfigCustomEnv(t *testing.T) {
 	}
 	if cfg.MetricsCollectionInterval != 15*time.Second {
 		t.Errorf("expected metrics interval 15s, got %v", cfg.MetricsCollectionInterval)
+	}
+	if cfg.StacksDir != "/custom/stacks/" {
+		t.Errorf("expected stacks dir '/custom/stacks/', got %s", cfg.StacksDir)
+	}
+	if cfg.ArchivesDir != "/custom/archives/" {
+		t.Errorf("expected archives dir '/custom/archives/', got %s", cfg.ArchivesDir)
+	}
+	if cfg.ArchiveRetentionDays != 60 {
+		t.Errorf("expected retention 60 days, got %d", cfg.ArchiveRetentionDays)
 	}
 }

@@ -8,10 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Harkole/fenrir-daemon/internal/archive"
+	"github.com/Harkole/fenrir-daemon/internal/compose"
+	"github.com/Harkole/fenrir-daemon/internal/config"
 	"github.com/Harkole/fenrir-daemon/internal/database"
 	"github.com/Harkole/fenrir-daemon/internal/docker"
 	"github.com/Harkole/fenrir-daemon/internal/metrics"
@@ -24,16 +28,20 @@ type Handler struct {
 	dockerMonitor *docker.Monitor
 	hostCollector *metrics.HostCollector
 	db            *database.DB
+	composeEngine *compose.Engine
+	cfg           *config.Config
 	startTime     time.Time
 	version       string
 }
 
 // NewHandler creates a new Handler with injected dependencies.
-func NewHandler(dm *docker.Monitor, hc *metrics.HostCollector, db *database.DB, version string) *Handler {
+func NewHandler(dm *docker.Monitor, hc *metrics.HostCollector, db *database.DB, ce *compose.Engine, cfg *config.Config, version string) *Handler {
 	return &Handler{
 		dockerMonitor: dm,
 		hostCollector: hc,
 		db:            db,
+		composeEngine: ce,
+		cfg:           cfg,
 		startTime:     time.Now().UTC(),
 		version:       version,
 	}
@@ -41,11 +49,11 @@ func NewHandler(dm *docker.Monitor, hc *metrics.HostCollector, db *database.DB, 
 
 // HealthResponse represents system health information.
 type HealthResponse struct {
-	Status        string        `json:"status"` // "ok", "degraded"
-	Version       string        `json:"version"`
-	UptimeSeconds float64       `json:"uptimeSeconds"`
-	Docker        DockerStatus  `json:"docker"`
-	Database      DBStatus      `json:"database"`
+	Status        string       `json:"status"` // "ok", "degraded"
+	Version       string       `json:"version"`
+	UptimeSeconds float64      `json:"uptimeSeconds"`
+	Docker        DockerStatus `json:"docker"`
+	Database      DBStatus     `json:"database"`
 }
 
 // DockerStatus indicates connection state to the Docker daemon.
@@ -349,6 +357,688 @@ func (h *Handler) HandleContainerMetricsHistory(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, records)
 }
 
+// --- Docker Compose Stack Management Handlers ---
+
+// HandleListProjects returns all registered Docker Compose stacks.
+func (h *Handler) HandleListProjects(w http.ResponseWriter, r *http.Request) {
+	if h.db == nil {
+		writeError(w, http.StatusServiceUnavailable, "database is not initialized")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	projects, err := h.db.ListProjects(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list projects: "+err.Error())
+		return
+	}
+
+	if projects == nil {
+		projects = []model.Project{}
+	}
+
+	writeJSON(w, http.StatusOK, projects)
+}
+
+// HandleGetProject returns detailed information for a specific project.
+func (h *Handler) HandleGetProject(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	if h.db == nil {
+		writeError(w, http.StatusServiceUnavailable, "database is not initialized")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	p, err := h.db.GetProject(ctx, name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("project %q not found", name))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get project: "+err.Error())
+		return
+	}
+
+	var composeContent string
+	var files []string
+	var hasDataDir bool
+
+	if h.composeEngine != nil {
+		composeContent, _ = h.composeEngine.ReadComposeFile(name)
+		files, hasDataDir, _ = h.composeEngine.ListProjectFiles(name)
+	}
+
+	detail := model.ProjectDetail{
+		Project:        *p,
+		ComposeContent: composeContent,
+		Files:          files,
+		HasDataDir:     hasDataDir,
+	}
+
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// HandleCreateProject validates the payload via `docker compose config` pre-flight check,
+// provisions the directory structure, writes compose.yml, and begins asynchronous deployment.
+func (h *Handler) HandleCreateProject(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Name        string `json:"name"`
+		Compose     string `json:"compose"`
+		Description string `json:"description"`
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	// Try JSON parsing
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil || payload.Name == "" {
+		// Fallback: check query parameter ?name=<name> with raw compose body
+		qName := strings.TrimSpace(r.URL.Query().Get("name"))
+		if qName != "" {
+			payload.Name = qName
+			payload.Compose = string(bodyBytes)
+		} else {
+			writeError(w, http.StatusBadRequest, "invalid request: must provide JSON with name and compose fields, or ?name= query with raw body")
+			return
+		}
+	}
+
+	payload.Name = strings.TrimSpace(payload.Name)
+	payload.Compose = strings.TrimSpace(payload.Compose)
+
+	if payload.Name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+	if payload.Compose == "" {
+		writeError(w, http.StatusBadRequest, "compose content is required")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose execution engine is not initialized")
+		return
+	}
+
+	valCtx, valCancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer valCancel()
+
+	// 1. Pre-flight syntax and schema validation
+	valOutput, err := h.composeEngine.ValidateCompose(valCtx, payload.Compose)
+	if err != nil {
+		writeErrorWithData(w, http.StatusUnprocessableEntity, "pre-flight compose validation failed: "+err.Error(), map[string]any{
+			"details": valOutput,
+		})
+		return
+	}
+
+	// 2. Provision directory structure (/var/lib/fenrir/stacks/<name>/ and data/) and write compose.yml
+	provCtx, provCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer provCancel()
+
+	projectDir, err := h.composeEngine.ProvisionStack(provCtx, payload.Name, payload.Compose)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to provision stack files: "+err.Error())
+		return
+	}
+
+	// 3. Register or update project record in SQLite
+	p := &model.Project{
+		Name:          payload.Name,
+		DirectoryPath: projectDir,
+		ComposeFile:   "compose.yml",
+		Description:   payload.Description,
+		Status:        "deploying",
+	}
+
+	if h.db != nil {
+		if err := h.db.CreateProject(r.Context(), p); err != nil {
+			// If already registered, update existing project
+			_ = h.db.UpdateProject(r.Context(), p)
+		}
+	}
+
+	// 4. Trigger asynchronous deployment in background
+	go func(projName string) {
+		deployCtx, deployCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer deployCancel()
+
+		_, err := h.composeEngine.Up(deployCtx, projName)
+		if h.db != nil {
+			if err != nil {
+				_ = h.db.UpdateProjectStatus(context.Background(), projName, "failed")
+			} else {
+				_ = h.db.UpdateProjectStatus(context.Background(), projName, "running")
+			}
+		}
+	}(payload.Name)
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"project":       payload.Name,
+		"directoryPath": projectDir,
+		"status":        "deploying",
+		"message":       "compose configuration validated successfully; deployment initiated asynchronously",
+	})
+}
+
+// HandleGetProjectCompose retrieves the raw compose.yml content for a project.
+func (h *Handler) HandleGetProjectCompose(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	content, err := h.composeEngine.ReadComposeFile(name)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "failed to read compose file: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"project": name,
+		"compose": content,
+	})
+}
+
+// HandleUpdateProjectCompose updates the compose.yml file after pre-flight validation and redeploys.
+func (h *Handler) HandleUpdateProjectCompose(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	composeContent := string(bodyBytes)
+	var jsonPayload struct {
+		Compose string `json:"compose"`
+	}
+	if err := json.Unmarshal(bodyBytes, &jsonPayload); err == nil && jsonPayload.Compose != "" {
+		composeContent = jsonPayload.Compose
+	}
+
+	composeContent = strings.TrimSpace(composeContent)
+	if composeContent == "" {
+		writeError(w, http.StatusBadRequest, "compose content cannot be empty")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	// Pre-flight validation
+	valCtx, valCancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer valCancel()
+
+	valOutput, err := h.composeEngine.ValidateCompose(valCtx, composeContent)
+	if err != nil {
+		writeErrorWithData(w, http.StatusUnprocessableEntity, "pre-flight compose validation failed: "+err.Error(), map[string]any{
+			"details": valOutput,
+		})
+		return
+	}
+
+	// Write updated compose.yml
+	provCtx, provCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer provCancel()
+
+	_, err = h.composeEngine.ProvisionStack(provCtx, name, composeContent)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to write compose file: "+err.Error())
+		return
+	}
+
+	if h.db != nil {
+		_ = h.db.UpdateProjectStatus(r.Context(), name, "deploying")
+	}
+
+	// Trigger async redeployment
+	go func(projName string) {
+		deployCtx, deployCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer deployCancel()
+
+		_, err := h.composeEngine.Up(deployCtx, projName)
+		if h.db != nil {
+			if err != nil {
+				_ = h.db.UpdateProjectStatus(context.Background(), projName, "failed")
+			} else {
+				_ = h.db.UpdateProjectStatus(context.Background(), projName, "running")
+			}
+		}
+	}(name)
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"project": name,
+		"status":  "deploying",
+		"message": "compose file updated and deployment initiated asynchronously",
+	})
+}
+
+// HandleProjectUp runs `docker compose up -d` for a project stack.
+func (h *Handler) HandleProjectUp(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+
+	output, err := h.composeEngine.Up(ctx, name)
+	if err != nil {
+		if h.db != nil {
+			_ = h.db.UpdateProjectStatus(r.Context(), name, "failed")
+		}
+		writeError(w, http.StatusInternalServerError, "compose up failed: "+err.Error())
+		return
+	}
+
+	if h.db != nil {
+		_ = h.db.UpdateProjectStatus(r.Context(), name, "running")
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project": name,
+		"status":  "running",
+		"output":  output,
+	})
+}
+
+// HandleProjectDown stops and removes stack containers via `docker compose down`.
+func (h *Handler) HandleProjectDown(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	removeVolumes, _ := strconv.ParseBool(r.URL.Query().Get("remove_volumes"))
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+
+	output, err := h.composeEngine.Down(ctx, name, removeVolumes)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "compose down failed: "+err.Error())
+		return
+	}
+
+	if h.db != nil {
+		_ = h.db.UpdateProjectStatus(r.Context(), name, "stopped")
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project": name,
+		"status":  "stopped",
+		"output":  output,
+	})
+}
+
+// HandleProjectRestart runs `docker compose restart`.
+func (h *Handler) HandleProjectRestart(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+
+	output, err := h.composeEngine.Restart(ctx, name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "compose restart failed: "+err.Error())
+		return
+	}
+
+	if h.db != nil {
+		_ = h.db.UpdateProjectStatus(r.Context(), name, "running")
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project": name,
+		"status":  "running",
+		"output":  output,
+	})
+}
+
+// HandleProjectStatus runs `docker compose ps --format json`.
+func (h *Handler) HandleProjectStatus(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	services, output, err := h.composeEngine.Status(ctx, name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "compose status check failed: "+err.Error())
+		return
+	}
+
+	currentStatus := "stopped"
+	for _, s := range services {
+		if strings.EqualFold(s.State, "running") {
+			currentStatus = "running"
+			break
+		}
+	}
+
+	if h.db != nil {
+		_ = h.db.UpdateProjectStatus(r.Context(), name, currentStatus)
+	}
+
+	writeJSON(w, http.StatusOK, model.ProjectStatusResponse{
+		Project:  name,
+		Status:   currentStatus,
+		Services: services,
+		Output:   output,
+	})
+}
+
+// HandleProjectLogs fetches logs for a project stack.
+func (h *Handler) HandleProjectLogs(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	tail := 100
+	if rawTail := r.URL.Query().Get("tail"); rawTail != "" {
+		if parsed, err := strconv.Atoi(rawTail); err == nil && parsed > 0 {
+			tail = parsed
+		}
+	}
+	service := strings.TrimSpace(r.URL.Query().Get("service"))
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	logs, err := h.composeEngine.Logs(ctx, name, tail, service)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to fetch compose logs: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project": name,
+		"logs":    logs,
+	})
+}
+
+// HandleDeleteProject gracefully brings down the stack, generates a timestamped .zip archive
+// with a 90-day retention into /var/lib/fenrir/archives/, safely removes project files, and clears the DB record.
+func (h *Handler) HandleDeleteProject(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	defer cancel()
+
+	projectDir, err := h.composeEngine.ProjectPath(name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 1. Bring down stack gracefully
+	_, _ = h.composeEngine.Down(ctx, name, false)
+
+	// 2. Safeguard: bundle the project directory into a timestamped .zip archive before teardown
+	var archiveMeta *model.ArchiveMetadata
+	if _, err := os.Stat(projectDir); err == nil {
+		archivesDir := "/var/lib/fenrir/archives/"
+		retentionDays := 90
+		if h.cfg != nil {
+			if h.cfg.ArchivesDir != "" {
+				archivesDir = h.cfg.ArchivesDir
+			}
+			if h.cfg.ArchiveRetentionDays > 0 {
+				retentionDays = h.cfg.ArchiveRetentionDays
+			}
+		}
+
+		archiveMeta, err = archive.CreateZipArchive(ctx, name, projectDir, archivesDir, retentionDays)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "safe teardown failed: could not create backup archive: "+err.Error())
+			return
+		}
+
+		if h.db != nil {
+			_ = h.db.CreateArchive(ctx, archiveMeta)
+		}
+	}
+
+	// 3. Remove project files from disk safely
+	_ = os.RemoveAll(projectDir)
+
+	// 4. Remove project record from database
+	if h.db != nil {
+		_ = h.db.DeleteProject(ctx, name)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": "project torn down and archived successfully",
+		"project": name,
+		"archive": archiveMeta,
+	})
+}
+
+// --- Rolling Archive Handlers ---
+
+// HandleListArchives lists all backup archives with a countdown showing days until deletion.
+func (h *Handler) HandleListArchives(w http.ResponseWriter, r *http.Request) {
+	if h.db == nil {
+		writeError(w, http.StatusServiceUnavailable, "database is not initialized")
+		return
+	}
+
+	projectName := strings.TrimSpace(r.URL.Query().Get("project"))
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	archives, err := h.db.ListArchives(ctx, projectName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to query archives: "+err.Error())
+		return
+	}
+
+	if archives == nil {
+		archives = []model.ArchiveMetadata{}
+	}
+
+	writeJSON(w, http.StatusOK, archives)
+}
+
+// HandleGetProjectArchives lists backup archives specifically for a given project name.
+func (h *Handler) HandleGetProjectArchives(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	if h.db == nil {
+		writeError(w, http.StatusServiceUnavailable, "database is not initialized")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	archives, err := h.db.ListArchives(ctx, name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to query project archives: "+err.Error())
+		return
+	}
+
+	if archives == nil {
+		archives = []model.ArchiveMetadata{}
+	}
+
+	writeJSON(w, http.StatusOK, archives)
+}
+
+// HandleRestoreArchive triggers manual restoration of a backup archive into the project stack directory.
+func (h *Handler) HandleRestoreArchive(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimSpace(r.PathValue("id"))
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "valid archive id is required")
+		return
+	}
+
+	if h.db == nil {
+		writeError(w, http.StatusServiceUnavailable, "database is not initialized")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+
+	archiveMeta, err := h.db.GetArchive(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("archive %d not found", id))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get archive metadata: "+err.Error())
+		return
+	}
+
+	targetDir, err := h.composeEngine.ProjectPath(archiveMeta.ProjectName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "invalid project directory path: "+err.Error())
+		return
+	}
+
+	// Extract zip file back into project directory
+	if err := archive.RestoreZipArchive(ctx, archiveMeta.ArchivePath, targetDir); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to restore archive: "+err.Error())
+		return
+	}
+
+	// Ensure project is registered in SQLite
+	p := &model.Project{
+		Name:          archiveMeta.ProjectName,
+		DirectoryPath: targetDir,
+		ComposeFile:   "compose.yml",
+		Status:        "stopped",
+	}
+	_ = h.db.CreateProject(ctx, p)
+	_ = h.db.UpdateProjectStatus(ctx, archiveMeta.ProjectName, "stopped")
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message":       "archive restored successfully",
+		"project":       archiveMeta.ProjectName,
+		"directoryPath": targetDir,
+		"archiveId":     id,
+	})
+}
+
+// HandleDeleteArchive deletes an archive zip file and its database record.
+func (h *Handler) HandleDeleteArchive(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimSpace(r.PathValue("id"))
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "valid archive id is required")
+		return
+	}
+
+	if h.db == nil {
+		writeError(w, http.StatusServiceUnavailable, "database is not initialized")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	archiveMeta, err := h.db.GetArchive(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("archive %d not found", id))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to query archive: "+err.Error())
+		return
+	}
+
+	// Delete file from disk
+	_ = os.Remove(archiveMeta.ArchivePath)
+
+	// Delete from database
+	if err := h.db.DeleteArchive(ctx, id); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete archive record: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message":   "archive deleted successfully",
+		"archiveId": id,
+	})
+}
+
+// --- Settings Handlers ---
+
 // HandleGetSettings returns all application settings stored in SQLite.
 func (h *Handler) HandleGetSettings(w http.ResponseWriter, r *http.Request) {
 	if h.db == nil {
@@ -475,6 +1165,8 @@ func (h *Handler) HandleDeleteSetting(w http.ResponseWriter, r *http.Request) {
 		"key":     key,
 	})
 }
+
+// --- API Key Handlers ---
 
 // HandleListAPIKeys lists metadata for all generated API keys.
 func (h *Handler) HandleListAPIKeys(w http.ResponseWriter, r *http.Request) {

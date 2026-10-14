@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/Harkole/fenrir-daemon/internal/api"
+	"github.com/Harkole/fenrir-daemon/internal/archive"
+	"github.com/Harkole/fenrir-daemon/internal/compose"
 	"github.com/Harkole/fenrir-daemon/internal/config"
 	"github.com/Harkole/fenrir-daemon/internal/database"
 	"github.com/Harkole/fenrir-daemon/internal/docker"
@@ -34,6 +36,8 @@ func main() {
 	}
 	log.Printf("[CONFIG] Game Keywords: %v", cfg.GameFilterKeywords)
 	log.Printf("[CONFIG] Database Path: %s", cfg.DatabasePath)
+	log.Printf("[CONFIG] Stacks Directory: %s", cfg.StacksDir)
+	log.Printf("[CONFIG] Archives Directory: %s", cfg.ArchivesDir)
 	if cfg.APIKey != "" {
 		log.Printf("[CONFIG] API Key Auth: ENABLED (master key configured)")
 	} else {
@@ -68,10 +72,13 @@ func main() {
 	}
 	cancelPing()
 
-	// 5. Initialize HTTP API Server
-	server := api.NewServer(cfg, dockerMonitor, hostCollector, db, version)
+	// 5. Initialize Docker Compose execution engine
+	composeEngine := compose.NewEngine(cfg.StacksDir, cfg.DockerHost)
 
-	// 6. Background container metrics history collection
+	// 6. Initialize HTTP API Server
+	server := api.NewServer(cfg, dockerMonitor, hostCollector, db, composeEngine, version)
+
+	// 7. Background container metrics history collection
 	stopCollector := make(chan struct{})
 	if cfg.MetricsCollectionInterval > 0 {
 		log.Printf("[INFO] Starting background container metrics collection (interval: %v)", cfg.MetricsCollectionInterval)
@@ -108,7 +115,38 @@ func main() {
 		}()
 	}
 
-	// 7. Channel to catch OS shutdown signals
+	// 8. 90-Day Rolling Archive Daily Pruning Worker
+	stopPruner := make(chan struct{})
+	go func() {
+		// Run an initial pruning check on startup
+		ctxInit, cancelInit := context.WithTimeout(context.Background(), 30*time.Second)
+		pruned, err := archive.PruneExpiredArchives(ctxInit, db)
+		if err == nil && pruned > 0 {
+			log.Printf("[INFO] Pruned %d expired stack archive(s) on startup", pruned)
+		}
+		cancelInit()
+
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopPruner:
+				return
+			case <-ticker.C:
+				ctxPrune, cancelPrune := context.WithTimeout(context.Background(), 2*time.Minute)
+				pCount, pErr := archive.PruneExpiredArchives(ctxPrune, db)
+				if pErr != nil {
+					log.Printf("[WARN] Background archive pruning error: %v", pErr)
+				} else if pCount > 0 {
+					log.Printf("[INFO] Automatically pruned %d expired archive(s)", pCount)
+				}
+				cancelPrune()
+			}
+		}
+	}()
+
+	// 9. Channel to catch OS shutdown signals
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
@@ -125,6 +163,7 @@ func main() {
 	log.Printf("[INFO] Received signal %v; initiating graceful shutdown...", sig)
 
 	close(stopCollector)
+	close(stopPruner)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
