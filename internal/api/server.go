@@ -55,6 +55,7 @@ func NewServer(cfg *config.Config, dm *docker.Monitor, hc *metrics.HostCollector
 
 	// 6. Docker Compose Stack Management endpoints
 	mux.HandleFunc("GET /api/v1/projects", h.HandleListProjects)
+	mux.HandleFunc("GET /api/v1/ports", h.HandleListActivePorts)
 	mux.Handle("POST /api/v1/projects", auth(http.HandlerFunc(h.HandleCreateProject)))
 	mux.HandleFunc("GET /api/v1/projects/{name}", h.HandleGetProject)
 	mux.HandleFunc("GET /api/v1/projects/{name}/compose", h.HandleGetProjectCompose)

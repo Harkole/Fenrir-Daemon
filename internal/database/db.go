@@ -77,6 +77,18 @@ CREATE TABLE IF NOT EXISTS archives (
 
 CREATE INDEX IF NOT EXISTS idx_archives_project ON archives(project_name);
 CREATE INDEX IF NOT EXISTS idx_archives_expires ON archives(expires_at);
+
+CREATE TABLE IF NOT EXISTS project_ports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_name TEXT NOT NULL,
+    host_port INTEGER NOT NULL,
+    container_port INTEGER NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'tcp',
+    UNIQUE(host_port, protocol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_ports_project ON project_ports(project_name);
+CREATE INDEX IF NOT EXISTS idx_project_ports_lookup ON project_ports(host_port, protocol);
 `
 
 // Open initializes and migrates the SQLite database at the specified path.

@@ -227,12 +227,15 @@ func (db *DB) UpdateProjectStatus(ctx context.Context, name, status string) erro
 	return nil
 }
 
-// DeleteProject deletes a project record by name.
+// DeleteProject deletes a project record and its allocated ports by name.
 func (db *DB) DeleteProject(ctx context.Context, name string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return fmt.Errorf("project name cannot be empty")
 	}
+
+	// Clean up port allocations first
+	_, _ = db.conn.ExecContext(ctx, "DELETE FROM project_ports WHERE project_name = ?;", name)
 
 	query := "DELETE FROM projects WHERE name = ?;"
 	res, err := db.conn.ExecContext(ctx, query, name)

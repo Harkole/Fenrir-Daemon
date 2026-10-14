@@ -38,6 +38,12 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.ArchiveRetentionDays != 90 {
 		t.Errorf("expected default retention 90 days, got %d", cfg.ArchiveRetentionDays)
 	}
+	if cfg.DefaultUID != 1000 {
+		t.Errorf("expected default UID 1000, got %d", cfg.DefaultUID)
+	}
+	if cfg.DefaultGID != 1000 {
+		t.Errorf("expected default GID 1000, got %d", cfg.DefaultGID)
+	}
 }
 
 func TestConfigCustomEnv(t *testing.T) {
@@ -51,6 +57,8 @@ func TestConfigCustomEnv(t *testing.T) {
 	os.Setenv("FENRIR_STACKS_DIR", "/custom/stacks/")
 	os.Setenv("FENRIR_ARCHIVES_DIR", "/custom/archives/")
 	os.Setenv("FENRIR_ARCHIVE_RETENTION_DAYS", "60")
+	os.Setenv("FENRIR_DEFAULT_UID", "1001")
+	os.Setenv("FENRIR_DEFAULT_GID", "1002")
 	defer func() {
 		os.Unsetenv("FENRIR_PORT")
 		os.Unsetenv("DOCKER_HOST")
@@ -62,6 +70,8 @@ func TestConfigCustomEnv(t *testing.T) {
 		os.Unsetenv("FENRIR_STACKS_DIR")
 		os.Unsetenv("FENRIR_ARCHIVES_DIR")
 		os.Unsetenv("FENRIR_ARCHIVE_RETENTION_DAYS")
+		os.Unsetenv("FENRIR_DEFAULT_UID")
+		os.Unsetenv("FENRIR_DEFAULT_GID")
 	}()
 
 	cfg := Load()
@@ -95,5 +105,11 @@ func TestConfigCustomEnv(t *testing.T) {
 	}
 	if cfg.ArchiveRetentionDays != 60 {
 		t.Errorf("expected retention 60 days, got %d", cfg.ArchiveRetentionDays)
+	}
+	if cfg.DefaultUID != 1001 {
+		t.Errorf("expected custom UID 1001, got %d", cfg.DefaultUID)
+	}
+	if cfg.DefaultGID != 1002 {
+		t.Errorf("expected custom GID 1002, got %d", cfg.DefaultGID)
 	}
 }

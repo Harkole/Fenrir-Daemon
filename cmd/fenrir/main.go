@@ -73,7 +73,7 @@ func main() {
 	cancelPing()
 
 	// 5. Initialize Docker Compose execution engine
-	composeEngine := compose.NewEngine(cfg.StacksDir, cfg.DockerHost)
+	composeEngine := compose.NewEngine(cfg.StacksDir, cfg.DockerHost, cfg.DefaultUID, cfg.DefaultGID)
 
 	// 6. Initialize HTTP API Server
 	server := api.NewServer(cfg, dockerMonitor, hostCollector, db, composeEngine, version)

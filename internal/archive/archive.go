@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Harkole/fenrir-daemon/internal/compose"
 	"github.com/Harkole/fenrir-daemon/internal/database"
 	"github.com/Harkole/fenrir-daemon/internal/model"
 )
@@ -130,8 +131,8 @@ func CreateZipArchive(ctx context.Context, projectName, projectDir, archivesDir 
 	}, nil
 }
 
-// RestoreZipArchive extracts an archive back into the target project directory.
-func RestoreZipArchive(ctx context.Context, archivePath, targetProjectDir string) error {
+// RestoreZipArchive extracts an archive back into the target project directory and enforces container permissions.
+func RestoreZipArchive(ctx context.Context, archivePath, targetProjectDir string, uid, gid int) error {
 	reader, err := zip.OpenReader(archivePath)
 	if err != nil {
 		return fmt.Errorf("failed to open zip archive %q: %w", archivePath, err)
@@ -187,6 +188,11 @@ func RestoreZipArchive(ctx context.Context, archivePath, targetProjectDir string
 		if err != nil {
 			return fmt.Errorf("failed to copy restored file %q: %w", cleanDestination, err)
 		}
+	}
+
+	// Recursively set file ownership/permissions for container users (e.g. UID/GID 1000)
+	if err := compose.SetStackPermissions(cleanTarget, uid, gid); err != nil {
+		log.Printf("warn: failed to set permissions after archive restore on %s: %v", cleanTarget, err)
 	}
 
 	return nil

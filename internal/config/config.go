@@ -42,6 +42,12 @@ type Config struct {
 
 	// ArchiveRetentionDays is the duration in days to retain stack backup archives before automatic pruning (default: 90).
 	ArchiveRetentionDays int
+
+	// DefaultUID is the target user ID for stack directory permissions (default: 1000).
+	DefaultUID int
+
+	// DefaultGID is the target group ID for stack directory permissions (default: 1000).
+	DefaultGID int
 }
 
 // Load reads configuration from environment variables with fallback defaults.
@@ -78,6 +84,18 @@ func Load() *Config {
 		retentionDays = 90
 	}
 
+	rawUID := getEnv("FENRIR_DEFAULT_UID", "1000")
+	uid, err := strconv.Atoi(rawUID)
+	if err != nil || uid < 0 {
+		uid = 1000
+	}
+
+	rawGID := getEnv("FENRIR_DEFAULT_GID", "1000")
+	gid, err := strconv.Atoi(rawGID)
+	if err != nil || gid < 0 {
+		gid = 1000
+	}
+
 	return &Config{
 		ServerPort:                port,
 		DockerHost:                getEnv("DOCKER_HOST", ""),
@@ -90,6 +108,8 @@ func Load() *Config {
 		StacksDir:                 getEnv("FENRIR_STACKS_DIR", "/var/lib/fenrir/stacks/"),
 		ArchivesDir:               getEnv("FENRIR_ARCHIVES_DIR", "/var/lib/fenrir/archives/"),
 		ArchiveRetentionDays:      retentionDays,
+		DefaultUID:                uid,
+		DefaultGID:                gid,
 	}
 }
 

@@ -56,7 +56,7 @@ func TestCreateAndRestoreArchive(t *testing.T) {
 
 	// 2. Restore Archive into a fresh location
 	restoreDir := filepath.Join(tempDir, "restored", "atm10")
-	if err := RestoreZipArchive(ctx, meta.ArchivePath, restoreDir); err != nil {
+	if err := RestoreZipArchive(ctx, meta.ArchivePath, restoreDir, 1000, 1000); err != nil {
 		t.Fatalf("failed to restore archive: %v", err)
 	}
 

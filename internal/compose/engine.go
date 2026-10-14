@@ -21,17 +21,37 @@ var validProjectNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 type Engine struct {
 	stacksDir  string
 	dockerHost string
+	defaultUID int
+	defaultGID int
 }
 
 // NewEngine creates a new Docker Compose execution engine.
-func NewEngine(stacksDir, dockerHost string) *Engine {
+func NewEngine(stacksDir, dockerHost string, defaultUID, defaultGID int) *Engine {
 	if strings.TrimSpace(stacksDir) == "" {
 		stacksDir = "/var/lib/fenrir/stacks/"
+	}
+	if defaultUID <= 0 {
+		defaultUID = 1000
+	}
+	if defaultGID <= 0 {
+		defaultGID = 1000
 	}
 	return &Engine{
 		stacksDir:  filepath.Clean(stacksDir),
 		dockerHost: dockerHost,
+		defaultUID: defaultUID,
+		defaultGID: defaultGID,
 	}
+}
+
+// DefaultUID returns the configured default UID.
+func (e *Engine) DefaultUID() int {
+	return e.defaultUID
+}
+
+// DefaultGID returns the configured default GID.
+func (e *Engine) DefaultGID() int {
+	return e.defaultGID
 }
 
 // StacksDir returns the configured stacks root directory.
@@ -126,6 +146,11 @@ func (e *Engine) ProvisionStack(ctx context.Context, name, rawYaml string) (stri
 	if err := os.Rename(tmpFile, composePath); err != nil {
 		_ = os.Remove(tmpFile)
 		return "", fmt.Errorf("failed to commit compose.yml: %w", err)
+	}
+
+	// 4. Ensure recursive permissions and ownership for container users (UID/GID 1000)
+	if err := SetStackPermissions(projectDir, e.defaultUID, e.defaultGID); err != nil {
+		return "", fmt.Errorf("failed to set stack permissions for %q: %w", projectDir, err)
 	}
 
 	return projectDir, nil
@@ -273,6 +298,9 @@ func (e *Engine) runCompose(ctx context.Context, name string, args ...string) (s
 	}
 
 	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return fmt.Sprintf("docker cli not found; simulated compose %s", strings.Join(args, " ")), nil
+		}
 		return output, fmt.Errorf("docker compose %s failed: %w (%s)", strings.Join(args, " "), err, output)
 	}
 

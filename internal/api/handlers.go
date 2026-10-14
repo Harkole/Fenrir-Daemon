@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -382,6 +383,29 @@ func (h *Handler) HandleListProjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, projects)
 }
 
+// HandleListActivePorts returns all host ports currently allocated across active stacks.
+func (h *Handler) HandleListActivePorts(w http.ResponseWriter, r *http.Request) {
+	if h.db == nil {
+		writeError(w, http.StatusServiceUnavailable, "database is not initialized")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	ports, err := h.db.ListActivePorts(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to query active ports: "+err.Error())
+		return
+	}
+
+	if ports == nil {
+		ports = []model.ProjectPort{}
+	}
+
+	writeJSON(w, http.StatusOK, ports)
+}
+
 // HandleGetProject returns detailed information for a specific project.
 func (h *Handler) HandleGetProject(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.PathValue("name"))
@@ -417,11 +441,17 @@ func (h *Handler) HandleGetProject(w http.ResponseWriter, r *http.Request) {
 		files, hasDataDir, _ = h.composeEngine.ListProjectFiles(name)
 	}
 
+	ports, _ := h.db.GetProjectPorts(ctx, name)
+	if ports == nil {
+		ports = []model.ProjectPort{}
+	}
+
 	detail := model.ProjectDetail{
 		Project:        *p,
 		ComposeContent: composeContent,
 		Files:          files,
 		HasDataDir:     hasDataDir,
+		Ports:          ports,
 	}
 
 	writeJSON(w, http.StatusOK, detail)
@@ -484,6 +514,29 @@ func (h *Handler) HandleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1b. Parse host port bindings and validate against active stacks
+	ports, err := compose.ParseComposePorts(payload.Compose)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid port configuration in compose: "+err.Error())
+		return
+	}
+
+	if h.db != nil {
+		conflicts, err := h.db.CheckPortConflicts(r.Context(), payload.Name, ports)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed checking port conflicts: "+err.Error())
+			return
+		}
+		if len(conflicts) > 0 {
+			first := conflicts[0]
+			writeErrorWithData(w, http.StatusBadRequest, fmt.Sprintf("port conflict: host port %d/%s is already allocated to project %q", first.HostPort, first.Protocol, first.AllocatedTo), map[string]any{
+				"conflict":  first,
+				"conflicts": conflicts,
+			})
+			return
+		}
+	}
+
 	// 2. Provision directory structure (/var/lib/fenrir/stacks/<name>/ and data/) and write compose.yml
 	provCtx, provCancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer provCancel()
@@ -507,6 +560,9 @@ func (h *Handler) HandleCreateProject(w http.ResponseWriter, r *http.Request) {
 		if err := h.db.CreateProject(r.Context(), p); err != nil {
 			// If already registered, update existing project
 			_ = h.db.UpdateProject(r.Context(), p)
+		}
+		if err := h.db.AllocateProjectPorts(r.Context(), payload.Name, ports); err != nil {
+			log.Printf("[WARN] Failed to record allocated ports for %q: %v", payload.Name, err)
 		}
 	}
 
@@ -603,6 +659,29 @@ func (h *Handler) HandleUpdateProjectCompose(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Parse host port bindings and validate against active stacks
+	ports, err := compose.ParseComposePorts(composeContent)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid port configuration in compose: "+err.Error())
+		return
+	}
+
+	if h.db != nil {
+		conflicts, err := h.db.CheckPortConflicts(r.Context(), name, ports)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed checking port conflicts: "+err.Error())
+			return
+		}
+		if len(conflicts) > 0 {
+			first := conflicts[0]
+			writeErrorWithData(w, http.StatusBadRequest, fmt.Sprintf("port conflict: host port %d/%s is already allocated to project %q", first.HostPort, first.Protocol, first.AllocatedTo), map[string]any{
+				"conflict":  first,
+				"conflicts": conflicts,
+			})
+			return
+		}
+	}
+
 	// Write updated compose.yml
 	provCtx, provCancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer provCancel()
@@ -615,6 +694,7 @@ func (h *Handler) HandleUpdateProjectCompose(w http.ResponseWriter, r *http.Requ
 
 	if h.db != nil {
 		_ = h.db.UpdateProjectStatus(r.Context(), name, "deploying")
+		_ = h.db.AllocateProjectPorts(r.Context(), name, ports)
 	}
 
 	// Trigger async redeployment
@@ -652,6 +732,31 @@ func (h *Handler) HandleProjectUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate that the project's ports do not collide with another active stack
+	var allocatedPorts []model.ProjectPort
+	if h.db != nil {
+		composeContent, err := h.composeEngine.ReadComposeFile(name)
+		if err == nil {
+			ports, err := compose.ParseComposePorts(composeContent)
+			if err == nil && len(ports) > 0 {
+				conflicts, err := h.db.CheckPortConflicts(r.Context(), name, ports)
+				if err != nil {
+					writeError(w, http.StatusInternalServerError, "failed checking port conflicts: "+err.Error())
+					return
+				}
+				if len(conflicts) > 0 {
+					first := conflicts[0]
+					writeErrorWithData(w, http.StatusBadRequest, fmt.Sprintf("port conflict: host port %d/%s is already allocated to project %q", first.HostPort, first.Protocol, first.AllocatedTo), map[string]any{
+						"conflict":  first,
+						"conflicts": conflicts,
+					})
+					return
+				}
+				allocatedPorts = ports
+			}
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -666,6 +771,9 @@ func (h *Handler) HandleProjectUp(w http.ResponseWriter, r *http.Request) {
 
 	if h.db != nil {
 		_ = h.db.UpdateProjectStatus(r.Context(), name, "running")
+		if len(allocatedPorts) > 0 {
+			_ = h.db.AllocateProjectPorts(r.Context(), name, allocatedPorts)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -701,6 +809,7 @@ func (h *Handler) HandleProjectDown(w http.ResponseWriter, r *http.Request) {
 
 	if h.db != nil {
 		_ = h.db.UpdateProjectStatus(r.Context(), name, "stopped")
+		_ = h.db.ReleaseProjectPorts(r.Context(), name)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -839,8 +948,11 @@ func (h *Handler) HandleDeleteProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Bring down stack gracefully
+	// 1. Bring down stack gracefully and release allocated ports
 	_, _ = h.composeEngine.Down(ctx, name, false)
+	if h.db != nil {
+		_ = h.db.ReleaseProjectPorts(ctx, name)
+	}
 
 	// 2. Safeguard: bundle the project directory into a timestamped .zip archive before teardown
 	var archiveMeta *model.ArchiveMetadata
@@ -971,8 +1083,19 @@ func (h *Handler) HandleRestoreArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract zip file back into project directory
-	if err := archive.RestoreZipArchive(ctx, archiveMeta.ArchivePath, targetDir); err != nil {
+	// Extract zip file back into project directory and enforce container permissions
+	uid := 1000
+	gid := 1000
+	if h.cfg != nil {
+		if h.cfg.DefaultUID > 0 {
+			uid = h.cfg.DefaultUID
+		}
+		if h.cfg.DefaultGID > 0 {
+			gid = h.cfg.DefaultGID
+		}
+	}
+
+	if err := archive.RestoreZipArchive(ctx, archiveMeta.ArchivePath, targetDir, uid, gid); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to restore archive: "+err.Error())
 		return
 	}

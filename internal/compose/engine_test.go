@@ -11,7 +11,7 @@ func TestEngineProvisionAndFiles(t *testing.T) {
 	tempDir := t.TempDir()
 	stacksDir := filepath.Join(tempDir, "stacks")
 
-	engine := NewEngine(stacksDir, "")
+	engine := NewEngine(stacksDir, "", 1000, 1000)
 	ctx := context.Background()
 
 	rawCompose := `services:
@@ -65,7 +65,7 @@ func TestEngineProvisionAndFiles(t *testing.T) {
 
 func TestEngineValidateEmptyPayload(t *testing.T) {
 	tempDir := t.TempDir()
-	engine := NewEngine(tempDir, "")
+	engine := NewEngine(tempDir, "", 1000, 1000)
 
 	ctx := context.Background()
 	_, err := engine.ValidateCompose(ctx, "   ")
@@ -76,7 +76,7 @@ func TestEngineValidateEmptyPayload(t *testing.T) {
 
 func TestInvalidProjectName(t *testing.T) {
 	tempDir := t.TempDir()
-	engine := NewEngine(tempDir, "")
+	engine := NewEngine(tempDir, "", 1000, 1000)
 
 	invalidNames := []string{"../escape", "foo/bar", "foo\\bar", "", "  ", "space in name"}
 	for _, name := range invalidNames {

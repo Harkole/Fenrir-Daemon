@@ -45,7 +45,7 @@ func setupTestServer(t *testing.T, apiKey string) (*Server, *database.DB, *compo
 		_ = dm.Close()
 	})
 
-	ce := compose.NewEngine(stacksDir, "")
+	ce := compose.NewEngine(stacksDir, "", 1000, 1000)
 
 	hc := metrics.NewHostCollector(1 * time.Second)
 	cfg := &config.Config{
@@ -57,6 +57,8 @@ func setupTestServer(t *testing.T, apiKey string) (*Server, *database.DB, *compo
 		StacksDir:                 stacksDir,
 		ArchivesDir:               archivesDir,
 		ArchiveRetentionDays:      90,
+		DefaultUID:                1000,
+		DefaultGID:                1000,
 	}
 
 	server := NewServer(cfg, dm, hc, db, ce, "0.2.0-test")
@@ -449,3 +451,116 @@ func TestSettingsEndpoints(t *testing.T) {
 		t.Fatalf("expected 200 on DELETE setting, got %d", delW.Code)
 	}
 }
+
+func TestPortCollisionValidationAndLifecycle(t *testing.T) {
+	apiKey := "ports-test-key"
+	server, _, engine, _ := setupTestServer(t, apiKey)
+
+	composeAlpha := `services:
+  mc:
+    image: itzg/minecraft-server
+    ports:
+      - "25565:25565"
+      - "19132:19132/udp"
+`
+
+	// 1. Create project "mc-alpha"
+	createAlphaReq := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(fmt.Sprintf(`{
+		"name": "mc-alpha",
+		"compose": %q
+	}`, composeAlpha)))
+	createAlphaReq.Header.Set("Content-Type", "application/json")
+	createAlphaReq.Header.Set("X-API-Key", apiKey)
+	createAlphaW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(createAlphaW, createAlphaReq)
+
+	if createAlphaW.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted on creating mc-alpha, got %d: %s", createAlphaW.Code, createAlphaW.Body.String())
+	}
+
+	// 2. Query GET /api/v1/ports to verify active port tracking
+	portsReq := httptest.NewRequest(http.MethodGet, "/api/v1/ports", nil)
+	portsW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(portsW, portsReq)
+
+	if portsW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on GET /api/v1/ports, got %d", portsW.Code)
+	}
+
+	var portsResp APIResponse
+	_ = json.NewDecoder(portsW.Body).Decode(&portsResp)
+	portsList, ok := portsResp.Data.([]any)
+	if !ok || len(portsList) != 2 {
+		t.Fatalf("expected 2 active ports allocated, got %v", portsResp.Data)
+	}
+
+	// 3. Attempt to create project "mc-beta" colliding on host port 25565/tcp
+	composeBeta := `services:
+  mc2:
+    image: itzg/minecraft-server
+    ports:
+      - "25565:25565"
+`
+	createBetaReq := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(fmt.Sprintf(`{
+		"name": "mc-beta",
+		"compose": %q
+	}`, composeBeta)))
+	createBetaReq.Header.Set("Content-Type", "application/json")
+	createBetaReq.Header.Set("X-API-Key", apiKey)
+	createBetaW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(createBetaW, createBetaReq)
+
+	// Must be rejected immediately with HTTP 400 Bad Request
+	if createBetaW.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request on port collision, got %d: %s", createBetaW.Code, createBetaW.Body.String())
+	}
+
+	var betaErrResp APIResponse
+	_ = json.NewDecoder(createBetaW.Body).Decode(&betaErrResp)
+	if !strings.Contains(betaErrResp.Error, "port conflict: host port 25565/tcp is already allocated to project \"mc-alpha\"") {
+		t.Errorf("expected conflict message identifying 25565/tcp and mc-alpha, got: %s", betaErrResp.Error)
+	}
+
+	// Verify disk for mc-beta was NOT created (host remains untouched)
+	betaDir, _ := engine.ProjectPath("mc-beta")
+	if _, err := os.Stat(betaDir); !os.IsNotExist(err) {
+		t.Fatalf("expected mc-beta directory not to exist, but stat returned err: %v", err)
+	}
+
+	// 4. Down the mc-alpha stack to release the port
+	downReq := httptest.NewRequest(http.MethodPost, "/api/v1/projects/mc-alpha/down", nil)
+	downReq.Header.Set("X-API-Key", apiKey)
+	downW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(downW, downReq)
+
+	if downW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on down, got %d: %s", downW.Code, downW.Body.String())
+	}
+
+	// 5. Verify ports list is now freed
+	portsAfterDownReq := httptest.NewRequest(http.MethodGet, "/api/v1/ports", nil)
+	portsAfterDownW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(portsAfterDownW, portsAfterDownReq)
+
+	var portsAfterDownResp APIResponse
+	_ = json.NewDecoder(portsAfterDownW.Body).Decode(&portsAfterDownResp)
+	portsAfterDownList, _ := portsAfterDownResp.Data.([]any)
+	if len(portsAfterDownList) != 0 {
+		t.Fatalf("expected 0 active ports after down, got %d", len(portsAfterDownList))
+	}
+
+	// 6. Now creating mc-beta on 25565 succeeds because port was freed
+	createBetaRetryReq := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(fmt.Sprintf(`{
+		"name": "mc-beta",
+		"compose": %q
+	}`, composeBeta)))
+	createBetaRetryReq.Header.Set("Content-Type", "application/json")
+	createBetaRetryReq.Header.Set("X-API-Key", apiKey)
+	createBetaRetryW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(createBetaRetryW, createBetaRetryReq)
+
+	if createBetaRetryW.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted on retrying mc-beta after port release, got %d: %s", createBetaRetryW.Code, createBetaRetryW.Body.String())
+	}
+}
+

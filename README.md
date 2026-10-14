@@ -25,7 +25,9 @@ fenrir-daemon/
 │   ├── archive/                 # 90-day rolling zip archive creation, restore, and pruning
 │   │   └── archive.go           # Directory zipping, zip slip protection, restore & prune logic
 │   ├── compose/                 # Docker Compose filesystem provisioning & execution engine
-│   │   └── engine.go            # Pre-flight syntax validation, stack provisioning, compose commands
+│   │   ├── engine.go            # Pre-flight syntax validation, stack provisioning, compose commands
+│   │   ├── permissions.go       # UID/GID 1000 container permissions enforcement
+│   │   └── ports.go             # Compose YAML host port parser (short & long syntax)
 │   ├── config/                  # Environment variable configuration loader
 │   │   └── config.go            # Runtime configuration
 │   ├── database/                # SQLite pure-Go persistence layer (modernc.org/sqlite)
@@ -33,6 +35,7 @@ fenrir-daemon/
 │   │   ├── db.go                # Connection pooling, WAL mode pragmas & schema migrations
 │   │   ├── keys.go              # API key hashing, creation & validation
 │   │   ├── metrics.go           # Container metrics history storage & pruning
+│   │   ├── ports.go             # Active host port allocation & collision tracking
 │   │   ├── projects.go          # Registered compose projects CRUD
 │   │   └── settings.go          # Application settings key-value store
 │   ├── docker/                  # Official Docker SDK client & container monitoring
@@ -67,6 +70,8 @@ Fenrir Daemon is configured via environment variables with sensible defaults:
 | `FENRIR_API_KEY` | *(empty)* | Pre-shared master API key for authenticating requests |
 | `FENRIR_METRICS_INTERVAL_SEC` | `30` | Interval in seconds for background container metrics collection |
 | `FENRIR_METRICS_CACHE_TTL_SEC` | `2` | Caching TTL for host hardware metrics |
+| `FENRIR_DEFAULT_UID` | `1000` | Target user ID for stack directory file permissions (Minecraft/Java container compatibility) |
+| `FENRIR_DEFAULT_GID` | `1000` | Target group ID for stack directory file permissions |
 | `FENRIR_GAME_KEYWORDS` | `minecraft,mc,itzg,paper,purpur,forge,fabric,spigot,bedrock,valheim` | Comma-separated keywords for auto-detecting game servers |
 | `FENRIR_CORS_ORIGINS` | `*` | Allowed CORS origins |
 
@@ -124,24 +129,27 @@ Protected by API Key authentication:
 - **`POST /api/v1/containers/{name}/stop`**: Gracefully stops a running container. Supports optional `?timeout=N` or `{"timeout": N}` body.
 - **`POST /api/v1/containers/{name}/restart`**: Restarts a container with optional timeout.
 
-### 5. Docker Compose Stack Management (Directory-Based)
+### 5. Docker Compose Stack Management & Infrastructure Safety
 - **`GET /api/v1/projects`**: List all registered stacks and runtime statuses.
+- **`GET /api/v1/ports`**: List all host ports currently bound by active stacks (`hostPort`, `containerPort`, `protocol`, `projectName`).
 - **`POST /api/v1/projects`** *(Auth Required)*: Provision a new stack directory (`/var/lib/fenrir/stacks/<name>/`), create `data/` volume directory, write `compose.yml`, and initiate async deployment.
-  - **Pre-flight Syntax & Schema Validation**: Runs `docker compose config` against a temporary file. If validation fails, returns `422 Unprocessable Entity` with error details, leaving the live host completely untouched.
-- **`GET /api/v1/projects/{name}`**: Get stack details, files list, data directory presence, and compose content.
+  - **Pre-flight Syntax & Schema Validation**: Runs `docker compose config` against a temporary file. If syntax validation fails, returns `422 Unprocessable Entity` with error details, leaving the live host completely untouched.
+  - **Active Port Collision Tracking & Validation**: Parses host ports defined in the incoming `compose.yml` (supporting short and long YAML syntax and port ranges) and validates against active stacks in SQLite. If a host port is already bound, returns `400 Bad Request` with collision details (`port conflict: host port 25565/tcp is already allocated to project "atm10"`), aborting before any files or directories are created on disk.
+  - **UID 1000 Container Permissions**: Recursively sets ownership and directory (`0775`) / file (`0664`) permissions across the stack directory and `data/` volume to match standard container user expectations (UID/GID 1000 or `FENRIR_DEFAULT_UID`/`GID`), preventing Java/Minecraft startup "Permission denied" errors.
+- **`GET /api/v1/projects/{name}`**: Get stack details, files list, data directory presence, compose content, and allocated host ports.
 - **`GET /api/v1/projects/{name}/compose`**: Read raw `compose.yml` content.
-- **`PUT /api/v1/projects/{name}/compose`** *(Auth Required)*: Update `compose.yml` with pre-flight validation and async redeployment.
-- **`POST /api/v1/projects/{name}/up`** *(Auth Required)*: Execute `docker compose up -d`.
-- **`POST /api/v1/projects/{name}/down`** *(Auth Required)*: Execute `docker compose down`.
+- **`PUT /api/v1/projects/{name}/compose`** *(Auth Required)*: Update `compose.yml` with pre-flight syntax and port collision validation before async redeployment.
+- **`POST /api/v1/projects/{name}/up`** *(Auth Required)*: Execute `docker compose up -d` with port conflict validation.
+- **`POST /api/v1/projects/{name}/down`** *(Auth Required)*: Execute `docker compose down`, immediately freeing allocated ports in SQLite.
 - **`POST /api/v1/projects/{name}/restart`** *(Auth Required)*: Execute `docker compose restart`.
 - **`GET /api/v1/projects/{name}/status`**: Run `docker compose ps --format json` to check service health.
 - **`GET /api/v1/projects/{name}/logs`**: View service container logs.
-- **`DELETE /api/v1/projects/{name}`** *(Auth Required)*: Safe teardown. Brings down stack, bundles the directory into a timestamped `.zip` archive in `/var/lib/fenrir/archives/` with a 90-day retention, removes project files, and clears database records.
+- **`DELETE /api/v1/projects/{name}`** *(Auth Required)*: Safe teardown. Brings down stack, instantly releases host port allocations, bundles the directory into a timestamped `.zip` archive in `/var/lib/fenrir/archives/` with a 90-day retention, removes project files, and clears database records.
 
 ### 6. 90-Day Rolling Archive & Restore System
 - **`GET /api/v1/archives`**: List all backup archives with a countdown showing `daysUntilDeletion` (days remaining until auto-prune).
 - **`GET /api/v1/projects/{name}/archives`**: List archives specifically for a project.
-- **`POST /api/v1/archives/{id}/restore`** *(Auth Required)*: Restore a `.zip` archive back into its stack directory with Zip Slip protection.
+- **`POST /api/v1/archives/{id}/restore`** *(Auth Required)*: Restore a `.zip` archive back into its stack directory with Zip Slip protection and recursive UID/GID 1000 permissions enforcement.
 - **`DELETE /api/v1/archives/{id}`** *(Auth Required)*: Delete an archive file and database record.
 - **Automated Daily Pruning**: A background goroutine checks daily and automatically removes expired archive `.zip` files and database records older than 90 days.
 
