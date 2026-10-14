@@ -1,10 +1,14 @@
 package api
 
 import (
+	"crypto/subtle"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/Harkole/fenrir-daemon/internal/config"
+	"github.com/Harkole/fenrir-daemon/internal/database"
 )
 
 // responseWriterInterceptor intercepts HTTP status codes for logging.
@@ -85,3 +89,71 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// APIKeyAuthMiddleware verifies incoming requests against keys configured or stored in the database layer.
+func APIKeyAuthMiddleware(cfg *config.Config, db *database.DB) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodOptions {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			key := extractAPIKey(r)
+			if key == "" {
+				writeError(w, http.StatusUnauthorized, "unauthorized: missing API key")
+				return
+			}
+
+			authenticated := false
+
+			// 1. Verify against static/pre-shared key in configuration
+			if cfg != nil && cfg.APIKey != "" {
+				if subtle.ConstantTimeCompare([]byte(key), []byte(cfg.APIKey)) == 1 {
+					authenticated = true
+				}
+			}
+
+			// 2. Verify against database stored keys
+			if !authenticated && db != nil {
+				valid, err := db.ValidateAPIKey(r.Context(), key)
+				if err == nil && valid {
+					authenticated = true
+				}
+			}
+
+			if !authenticated {
+				writeError(w, http.StatusUnauthorized, "unauthorized: invalid API key")
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// extractAPIKey retrieves the API key from headers (X-API-Key, Authorization) or query parameter.
+func extractAPIKey(r *http.Request) string {
+	if key := r.Header.Get("X-API-Key"); key != "" {
+		return strings.TrimSpace(key)
+	}
+
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if auth != "" {
+		lower := strings.ToLower(auth)
+		if strings.HasPrefix(lower, "bearer ") {
+			return strings.TrimSpace(auth[7:])
+		}
+		if strings.HasPrefix(lower, "apikey ") {
+			return strings.TrimSpace(auth[7:])
+		}
+		return auth
+	}
+
+	if qKey := r.URL.Query().Get("api_key"); qKey != "" {
+		return strings.TrimSpace(qKey)
+	}
+
+	return ""
+}
+

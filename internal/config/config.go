@@ -24,6 +24,15 @@ type Config struct {
 
 	// AllowedOrigins is the CORS allowed origins list (default: "*").
 	AllowedOrigins []string
+
+	// DatabasePath is the path to the SQLite database file (default: "fenrir.db").
+	DatabasePath string
+
+	// APIKey is a pre-shared master key for authenticating incoming API requests.
+	APIKey string
+
+	// MetricsCollectionInterval is the frequency to sample and record container metrics history.
+	MetricsCollectionInterval time.Duration
 }
 
 // Load reads configuration from environment variables with fallback defaults.
@@ -48,12 +57,21 @@ func Load() *Config {
 		}
 	}
 
+	rawInterval := getEnv("FENRIR_METRICS_INTERVAL_SEC", "30")
+	intervalSec, err := strconv.Atoi(rawInterval)
+	if err != nil || intervalSec < 0 {
+		intervalSec = 30
+	}
+
 	return &Config{
-		ServerPort:         port,
-		DockerHost:         getEnv("DOCKER_HOST", ""),
-		MetricsCacheTTL:    time.Duration(ttlSec) * time.Second,
-		GameFilterKeywords: keywords,
-		AllowedOrigins:     strings.Split(getEnv("FENRIR_CORS_ORIGINS", "*"), ","),
+		ServerPort:                port,
+		DockerHost:                getEnv("DOCKER_HOST", ""),
+		MetricsCacheTTL:           time.Duration(ttlSec) * time.Second,
+		GameFilterKeywords:        keywords,
+		AllowedOrigins:            strings.Split(getEnv("FENRIR_CORS_ORIGINS", "*"), ","),
+		DatabasePath:              getEnv("FENRIR_DB_PATH", "fenrir.db"),
+		APIKey:                    os.Getenv("FENRIR_API_KEY"),
+		MetricsCollectionInterval: time.Duration(intervalSec) * time.Second,
 	}
 }
 

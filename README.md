@@ -15,23 +15,29 @@ Fenrir follows standard Go project conventions with strict separation of concern
 fenrir-daemon/
 ├── cmd/
 │   └── fenrir/
-│       └── main.go              # Daemon entry point & graceful shutdown
+│       └── main.go              # Daemon entry point, background collector & graceful shutdown
 ├── internal/
 │   ├── api/                     # HTTP router, middleware, handlers (net/http)
-│   │   ├── handlers.go          # Route handlers (/health, /host, /containers)
-│   │   ├── middleware.go        # Request logging, CORS, recovery
+│   │   ├── handlers.go          # Route handlers (/health, /host, /containers, lifecycle, settings)
+│   │   ├── middleware.go        # Request logging, CORS, recovery, API Key authentication
 │   │   ├── response.go          # Standard JSON response envelopes
 │   │   └── server.go            # HTTP server wrapper & routing table
 │   ├── config/                  # Environment variable configuration loader
-│   │   └── config.go
+│   │   └── config.go            # Runtime configuration
+│   ├── database/                # SQLite pure-Go persistence layer (modernc.org/sqlite)
+│   │   ├── db.go                # Connection pooling, WAL mode pragmas & schema migrations
+│   │   ├── keys.go              # API key hashing, creation & validation
+│   │   ├── metrics.go           # Container metrics history storage & pruning
+│   │   └── settings.go          # Application settings key-value store
 │   ├── docker/                  # Official Docker SDK client & container monitoring
-│   │   └── monitor.go           # Inspection, stats calculation, game detection
+│   │   └── monitor.go           # Inspection, stats calculation, lifecycle controls (start/stop/restart)
 │   ├── metrics/                 # Host hardware metrics collection (gopsutil)
 │   │   └── host.go              # CPU, RAM, Disk partitions, Host OS, Load
 │   └── model/                   # Data transfer objects & schema definitions
 │       ├── container.go         # Container summary, detail, and resource stats
+│       ├── database.go          # Metrics history record, setting, and API key metadata
 │       └── host.go              # Host hardware metrics models
-├── .gitignore                   # Comprehensive Go gitignore
+├── .gitignore                   # Comprehensive Go & SQLite gitignore
 ├── go.mod
 └── go.sum
 ```
@@ -46,13 +52,31 @@ Fenrir Daemon is configured via environment variables with sensible defaults:
 |---|---|---|
 | `FENRIR_PORT` | `8080` | Port for the HTTP API server |
 | `DOCKER_HOST` | *(empty)* | Docker daemon endpoint (e.g. `unix:///var/run/docker.sock` or `tcp://linux-host:2375`) |
+| `FENRIR_DB_PATH` | `fenrir.db` | Local SQLite database file path (pure-Go driver) |
+| `FENRIR_API_KEY` | *(empty)* | Pre-shared master API key for authenticating requests |
+| `FENRIR_METRICS_INTERVAL_SEC` | `30` | Interval in seconds for background container metrics collection |
 | `FENRIR_METRICS_CACHE_TTL_SEC` | `2` | Caching TTL for host hardware metrics |
 | `FENRIR_GAME_KEYWORDS` | `minecraft,mc,itzg,paper,purpur,forge,fabric,spigot,bedrock,valheim` | Comma-separated keywords for auto-detecting game servers |
 | `FENRIR_CORS_ORIGINS` | `*` | Allowed CORS origins |
 
 ---
 
-## API Endpoints (Phase 1)
+## Security & API Key Authentication
+
+Control actions and sensitive data are secured by the API key authentication middleware. Requests are authenticated against:
+1. The master key configured via `FENRIR_API_KEY`, and/or
+2. Dynamic cryptographically hashed (SHA-256) API keys stored in SQLite (`fenrir.db`).
+
+Clients may supply keys via:
+- **Header:** `X-API-Key: <key>`
+- **Header:** `Authorization: Bearer <key>` or `Authorization: ApiKey <key>`
+- **Query Parameter:** `?api_key=<key>`
+
+Unauthenticated or invalid requests to protected endpoints return `401 Unauthorized` with a standard JSON error envelope.
+
+---
+
+## API Endpoints
 
 All endpoints return a standardized JSON envelope:
 ```json
@@ -64,24 +88,44 @@ All endpoints return a standardized JSON envelope:
 
 ### 1. Health & Connection Status
 - **`GET /api/v1/health`** (or `GET /health`)
-  - Reports daemon status (`ok` / `degraded`), uptime, version, and Docker daemon ping latency.
+  - Reports daemon status (`ok` / `degraded`), uptime, version, Docker daemon ping, and SQLite database connectivity.
 
 ### 2. Host Hardware Metrics
 - **`GET /api/v1/host`**
   - Returns CPU (overall + per-core percentages, core counts, CPU model), RAM and Swap metrics, mounted disk partitions usage, host OS metadata, and system load averages.
 
-### 3. Container Listing
+### 3. Container Monitoring & History
 - **`GET /api/v1/containers`**
   - Query parameters:
     - `tracked_only=true`: Filter only containers with `fenrir.enable=true`.
     - `type=<type>`: Filter by specific container type (e.g. `type=game`, `type=database`, `type=webapp`).
-    - `game_only=true`: Filter only containers classified as game servers (Minecraft, Valheim, Palworld, or tagged with `type=game`).
+    - `game_only=true`: Filter only containers classified as game servers.
     - `all=true`: Include stopped/exited containers.
     - `stats=true`: Include live CPU, Memory, and Network I/O metrics for running containers.
-
-### 4. Container Inspection
 - **`GET /api/v1/containers/{id}`**
   - Full details including volume mounts, networks, sanitized environment variables (credentials masked), health status, and live resource stats.
+- **`GET /api/v1/containers/{name}/metrics`**
+  - Retrieves time-series container metrics history persisted in SQLite. Supports `limit` (default 50) and `since` (e.g. `1h`, `24h`, RFC3339).
+
+### 4. Container Lifecycle Controls (Secure POST Endpoints)
+Protected by API Key authentication:
+- **`POST /api/v1/containers/{name}/start`**
+  - Starts a stopped container utilizing the Docker SDK.
+- **`POST /api/v1/containers/{name}/stop`**
+  - Gracefully stops a running container. Supports optional `?timeout=N` or `{"timeout": N}` body.
+- **`POST /api/v1/containers/{name}/restart`**
+  - Restarts a container with optional timeout.
+
+### 5. Application Settings (SQLite Persistence)
+- **`GET /api/v1/settings`**: List all application settings.
+- **`GET /api/v1/settings/{key}`**: Retrieve setting value by key.
+- **`PUT /api/v1/settings/{key}`**: Create or update setting (Requires API Key).
+- **`DELETE /api/v1/settings/{key}`**: Remove setting (Requires API Key).
+
+### 6. API Key Administration
+- **`GET /api/v1/auth/keys`**: List metadata for generated keys (Requires API Key).
+- **`POST /api/v1/auth/keys`**: Create a new API key (Requires API Key).
+- **`DELETE /api/v1/auth/keys/{prefix}`**: Revoke an API key (Requires API Key).
 
 ---
 

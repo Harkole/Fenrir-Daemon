@@ -12,11 +12,12 @@ import (
 
 	"github.com/Harkole/fenrir-daemon/internal/api"
 	"github.com/Harkole/fenrir-daemon/internal/config"
+	"github.com/Harkole/fenrir-daemon/internal/database"
 	"github.com/Harkole/fenrir-daemon/internal/docker"
 	"github.com/Harkole/fenrir-daemon/internal/metrics"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	log.Printf("==================================================")
@@ -32,11 +33,25 @@ func main() {
 		log.Printf("[CONFIG] Docker Host: default environment")
 	}
 	log.Printf("[CONFIG] Game Keywords: %v", cfg.GameFilterKeywords)
+	log.Printf("[CONFIG] Database Path: %s", cfg.DatabasePath)
+	if cfg.APIKey != "" {
+		log.Printf("[CONFIG] API Key Auth: ENABLED (master key configured)")
+	} else {
+		log.Printf("[CONFIG] API Key Auth: DATABASE-ONLY (or unconfigured)")
+	}
 
-	// 2. Initialize host hardware metrics collector
+	// 2. Initialize SQLite persistence layer
+	db, err := database.Open(cfg.DatabasePath)
+	if err != nil {
+		log.Fatalf("[FATAL] Failed to initialize SQLite database: %v", err)
+	}
+	defer db.Close()
+	log.Printf("[INFO] SQLite database initialized successfully at %s", cfg.DatabasePath)
+
+	// 3. Initialize host hardware metrics collector
 	hostCollector := metrics.NewHostCollector(cfg.MetricsCacheTTL)
 
-	// 3. Initialize Docker client monitor
+	// 4. Initialize Docker client monitor
 	dockerMonitor, err := docker.NewMonitor(cfg.DockerHost, cfg.GameFilterKeywords)
 	if err != nil {
 		log.Fatalf("[FATAL] Failed to configure Docker monitor: %v", err)
@@ -53,10 +68,47 @@ func main() {
 	}
 	cancelPing()
 
-	// 4. Initialize HTTP API Server
-	server := api.NewServer(cfg, dockerMonitor, hostCollector, version)
+	// 5. Initialize HTTP API Server
+	server := api.NewServer(cfg, dockerMonitor, hostCollector, db, version)
 
-	// 5. Channel to catch OS shutdown signals
+	// 6. Background container metrics history collection
+	stopCollector := make(chan struct{})
+	if cfg.MetricsCollectionInterval > 0 {
+		log.Printf("[INFO] Starting background container metrics collection (interval: %v)", cfg.MetricsCollectionInterval)
+		go func() {
+			ticker := time.NewTicker(cfg.MetricsCollectionInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-stopCollector:
+					return
+				case <-ticker.C:
+					ctxCollect, cancelCollect := context.WithTimeout(context.Background(), 15*time.Second)
+					containers, err := dockerMonitor.ListContainers(ctxCollect, false)
+					if err == nil {
+						for _, c := range containers {
+							if c.State == "running" {
+								statsCtx, statsCancel := context.WithTimeout(ctxCollect, 3*time.Second)
+								stats, err := dockerMonitor.GetContainerStats(statsCtx, c.ID)
+								statsCancel()
+								if err == nil {
+									name := ""
+									if len(c.Names) > 0 {
+										name = c.Names[0]
+									}
+									_ = db.RecordContainerMetric(ctxCollect, c.ID, name, stats, time.Now().UTC())
+								}
+							}
+						}
+					}
+					cancelCollect()
+				}
+			}
+		}()
+	}
+
+	// 7. Channel to catch OS shutdown signals
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
@@ -71,6 +123,8 @@ func main() {
 	// Wait for shutdown signal
 	sig := <-stopChan
 	log.Printf("[INFO] Received signal %v; initiating graceful shutdown...", sig)
+
+	close(stopCollector)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

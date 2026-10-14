@@ -522,3 +522,39 @@ func sanitizeEnv(envs []string) []string {
 
 	return sanitized
 }
+
+// StartContainer initiates execution of a stopped container by name or ID.
+func (m *Monitor) StartContainer(ctx context.Context, nameOrID string) error {
+	nameOrID = strings.TrimPrefix(strings.TrimSpace(nameOrID), "/")
+	if nameOrID == "" {
+		return fmt.Errorf("container name or id cannot be empty")
+	}
+	return m.cli.ContainerStart(ctx, nameOrID, container.StartOptions{})
+}
+
+// StopContainer stops a running container with an optional grace period timeout in seconds.
+func (m *Monitor) StopContainer(ctx context.Context, nameOrID string, timeoutSeconds *int) error {
+	nameOrID = strings.TrimPrefix(strings.TrimSpace(nameOrID), "/")
+	if nameOrID == "" {
+		return fmt.Errorf("container name or id cannot be empty")
+	}
+	var opts container.StopOptions
+	if timeoutSeconds != nil {
+		opts.Timeout = timeoutSeconds
+	}
+	return m.cli.ContainerStop(ctx, nameOrID, opts)
+}
+
+// RestartContainer stops and starts a container with an optional grace period timeout in seconds.
+func (m *Monitor) RestartContainer(ctx context.Context, nameOrID string, timeoutSeconds *int) error {
+	nameOrID = strings.TrimPrefix(strings.TrimSpace(nameOrID), "/")
+	if nameOrID == "" {
+		return fmt.Errorf("container name or id cannot be empty")
+	}
+	var opts container.StopOptions
+	if timeoutSeconds != nil {
+		opts.Timeout = timeoutSeconds
+	}
+	return m.cli.ContainerRestart(ctx, nameOrID, opts)
+}
+
