@@ -17,6 +17,12 @@ import (
 
 var validProjectNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
+// IsValidProjectName checks whether the given project name contains only allowed characters.
+func IsValidProjectName(name string) bool {
+	return validProjectNameRegex.MatchString(strings.TrimSpace(name))
+}
+
+
 // Engine manages Docker Compose stack filesystem provisioning and CLI execution.
 type Engine struct {
 	stacksDir  string

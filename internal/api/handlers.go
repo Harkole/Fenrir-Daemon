@@ -497,6 +497,27 @@ func (h *Handler) HandleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sanitizedContainerName := compose.SanitizeContainerName(payload.Name)
+	if sanitizedContainerName == "" {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid project name %q: cannot produce a valid container name", payload.Name))
+		return
+	}
+
+	// Apply container_name to compose YAML using the sanitized name value passed by Skoll
+	updatedCompose, err := compose.ApplyContainerName(payload.Compose, sanitizedContainerName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to apply container_name to compose: "+err.Error())
+		return
+	}
+	payload.Compose = updatedCompose
+
+	if !compose.IsValidProjectName(payload.Name) {
+		if payload.Description == "" {
+			payload.Description = payload.Name
+		}
+		payload.Name = sanitizedContainerName
+	}
+
 	if h.composeEngine == nil {
 		writeError(w, http.StatusServiceUnavailable, "compose execution engine is not initialized")
 		return
@@ -630,6 +651,7 @@ func (h *Handler) HandleUpdateProjectCompose(w http.ResponseWriter, r *http.Requ
 
 	composeContent := string(bodyBytes)
 	var jsonPayload struct {
+		Name    string `json:"name"`
 		Compose string `json:"compose"`
 	}
 	if err := json.Unmarshal(bodyBytes, &jsonPayload); err == nil && jsonPayload.Compose != "" {
@@ -640,6 +662,17 @@ func (h *Handler) HandleUpdateProjectCompose(w http.ResponseWriter, r *http.Requ
 	if composeContent == "" {
 		writeError(w, http.StatusBadRequest, "compose content cannot be empty")
 		return
+	}
+
+	targetName := name
+	if jsonPayload.Name != "" {
+		targetName = jsonPayload.Name
+	}
+	sanitizedContainerName := compose.SanitizeContainerName(targetName)
+	if sanitizedContainerName != "" {
+		if updated, err := compose.ApplyContainerName(composeContent, sanitizedContainerName); err == nil {
+			composeContent = updated
+		}
 	}
 
 	if h.composeEngine == nil {

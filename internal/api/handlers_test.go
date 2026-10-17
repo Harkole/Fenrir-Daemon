@@ -247,13 +247,13 @@ func TestCreateProject_SuccessAndProvisioning(t *testing.T) {
 		t.Fatalf("expected data directory to exist on disk: %v", err)
 	}
 
-	// 2. Verify compose.yml was committed
+	// 2. Verify compose.yml was committed with container_name overridden
 	savedCompose, err := os.ReadFile(filepath.Join(projectDir, "compose.yml"))
 	if err != nil {
 		t.Fatalf("failed to read compose.yml: %v", err)
 	}
-	if strings.TrimSpace(string(savedCompose)) != strings.TrimSpace(composeContent) {
-		t.Errorf("saved compose mismatch: got %q, expected %q", string(savedCompose), composeContent)
+	if !strings.Contains(string(savedCompose), "container_name: atm10") {
+		t.Errorf("saved compose missing container_name atm10: got %q", string(savedCompose))
 	}
 
 	// 3. Verify SQLite project record exists
@@ -282,6 +282,103 @@ func TestCreateProject_SuccessAndProvisioning(t *testing.T) {
 	}
 
 	_ = ce
+}
+
+func TestCreateProject_ContainerNameOverrideAndSanitization(t *testing.T) {
+	server, _, _, cfg := setupTestServer(t, "test-key")
+
+	// Compose file with existing placeholder container_name
+	composeContent := `services:
+  minecraft:
+    image: itzg/minecraft-server:latest
+    container_name: old-placeholder-name
+    ports:
+      - "25566:25565"
+`
+
+	// Skoll passes a name with spaces and special characters
+	payload, _ := json.Marshal(map[string]string{
+		"name":        "ATM 10 - Server! [Hardcore]",
+		"compose":     composeContent,
+		"description": "Modded Minecraft Server",
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-key")
+	w := httptest.NewRecorder()
+
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp APIResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	respMap := resp.Data.(map[string]any)
+
+	// Sanitized name should be ATM10-ServerHardcore
+	expectedName := "ATM10-ServerHardcore"
+	if respMap["project"] != expectedName {
+		t.Errorf("expected project name %q, got %q", expectedName, respMap["project"])
+	}
+
+	projectDir := filepath.Join(cfg.StacksDir, expectedName)
+	savedCompose, err := os.ReadFile(filepath.Join(projectDir, "compose.yml"))
+	if err != nil {
+		t.Fatalf("failed to read compose.yml: %v", err)
+	}
+
+	if !strings.Contains(string(savedCompose), "container_name: ATM10-ServerHardcore") {
+		t.Errorf("expected container_name: ATM10-ServerHardcore in compose.yml, got:\n%s", string(savedCompose))
+	}
+	if strings.Contains(string(savedCompose), "old-placeholder-name") {
+		t.Errorf("expected old-placeholder-name to be replaced, got:\n%s", string(savedCompose))
+	}
+}
+
+func TestUpdateProjectCompose_ContainerNameOverride(t *testing.T) {
+	server, _, ce, cfg := setupTestServer(t, "test-key")
+
+	// Provision initial stack
+	initialCompose := `services:
+  minecraft:
+    image: itzg/minecraft-server:latest
+    container_name: mc-server
+`
+	_, err := ce.ProvisionStack(context.Background(), "mc-server", initialCompose)
+	if err != nil {
+		t.Fatalf("failed to provision stack: %v", err)
+	}
+
+	// Update compose with new template lacking container_name or having different one
+	updatedContent := `services:
+  minecraft:
+    image: itzg/minecraft-server:nightly
+    container_name: another-name
+`
+	updateReq := httptest.NewRequest(http.MethodPut, "/api/v1/projects/mc-server/compose", strings.NewReader(updatedContent))
+	updateReq.Header.Set("X-API-Key", "test-key")
+	updateW := httptest.NewRecorder()
+
+	server.httpServer.Handler.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted on update compose, got %d: %s", updateW.Code, updateW.Body.String())
+	}
+
+	savedCompose, err := os.ReadFile(filepath.Join(cfg.StacksDir, "mc-server", "compose.yml"))
+	if err != nil {
+		t.Fatalf("failed to read updated compose.yml: %v", err)
+	}
+
+	if !strings.Contains(string(savedCompose), "container_name: mc-server") {
+		t.Errorf("expected container_name: mc-server in updated compose.yml, got:\n%s", string(savedCompose))
+	}
+	if strings.Contains(string(savedCompose), "another-name") {
+		t.Errorf("expected another-name to be replaced, got:\n%s", string(savedCompose))
+	}
 }
 
 func TestProjectTeardown_ArchiveAndCleanup(t *testing.T) {
