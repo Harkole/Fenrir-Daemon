@@ -47,3 +47,5 @@ logs/
 *.db-wal
 *.db-shm
 
+# Ignore the local deployment script
+deploy.ps1
