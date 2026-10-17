@@ -661,3 +661,268 @@ func TestPortCollisionValidationAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestUpdateProjectCompose_JSONPayloadAndDescription(t *testing.T) {
+	server, db, ce, cfg := setupTestServer(t, "test-key")
+
+	// 1. Provision initial stack and DB record
+	initialCompose := `services:
+  valheim:
+    image: lloesche/valheim-server:latest
+`
+	_, err := ce.ProvisionStack(context.Background(), "valheim", initialCompose)
+	if err != nil {
+		t.Fatalf("failed to provision stack: %v", err)
+	}
+	p := &model.Project{
+		Name:          "valheim",
+		DirectoryPath: filepath.Join(cfg.StacksDir, "valheim"),
+		ComposeFile:   "compose.yml",
+		Description:   "Initial description",
+		Status:        "running",
+	}
+	_ = db.CreateProject(context.Background(), p)
+
+	// 2. Update with JSON payload including updated description and redeploy=false
+	updatePayload := map[string]any{
+		"compose": `services:
+  valheim:
+    image: lloesche/valheim-server:v2
+    ports:
+      - "2456:2456/udp"
+`,
+		"description": "Updated Valheim Dedicated Server",
+		"redeploy":    false,
+	}
+	payloadBytes, _ := json.Marshal(updatePayload)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/projects/valheim/compose", bytes.NewReader(payloadBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-key")
+	w := httptest.NewRecorder()
+
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK with redeploy=false, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Verify file on disk is updated with container_name
+	saved, err := os.ReadFile(filepath.Join(cfg.StacksDir, "valheim", "compose.yml"))
+	if err != nil {
+		t.Fatalf("failed to read updated compose: %v", err)
+	}
+	if !strings.Contains(string(saved), "lloesche/valheim-server:v2") {
+		t.Errorf("expected updated image in compose.yml, got:\n%s", string(saved))
+	}
+	if !strings.Contains(string(saved), "container_name: valheim") {
+		t.Errorf("expected container_name: valheim, got:\n%s", string(saved))
+	}
+
+	// 4. Verify DB description updated
+	updatedProj, err := db.GetProject(context.Background(), "valheim")
+	if err != nil {
+		t.Fatalf("failed to get project from DB: %v", err)
+	}
+	if updatedProj.Description != "Updated Valheim Dedicated Server" {
+		t.Errorf("expected updated description, got %q", updatedProj.Description)
+	}
+	if updatedProj.Status != "updated" {
+		t.Errorf("expected status 'updated', got %q", updatedProj.Status)
+	}
+
+	// 5. Verify ports allocated in DB
+	ports, _ := db.GetProjectPorts(context.Background(), "valheim")
+	if len(ports) != 1 || ports[0].HostPort != 2456 || ports[0].Protocol != "udp" {
+		t.Errorf("expected port 2456/udp allocated, got %v", ports)
+	}
+}
+
+func TestUpdateProject_PutProjectRoute(t *testing.T) {
+	server, _, ce, cfg := setupTestServer(t, "test-key")
+
+	_, err := ce.ProvisionStack(context.Background(), "web-app", "services:\n  nginx:\n    image: nginx:alpine\n")
+	if err != nil {
+		t.Fatalf("failed to provision: %v", err)
+	}
+
+	// PUT /api/v1/projects/web-app
+	newYAML := "services:\n  nginx:\n    image: nginx:latest\n"
+	body, _ := json.Marshal(map[string]any{
+		"yaml":     newYAML,
+		"redeploy": false,
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/projects/web-app", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-key")
+	w := httptest.NewRecorder()
+
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on PUT /api/v1/projects/web-app, got %d: %s", w.Code, w.Body.String())
+	}
+
+	saved, _ := os.ReadFile(filepath.Join(cfg.StacksDir, "web-app", "compose.yml"))
+	if !strings.Contains(string(saved), "nginx:latest") {
+		t.Errorf("expected updated image in compose.yml, got:\n%s", string(saved))
+	}
+}
+
+func TestUpdateProjectCompose_DryRun(t *testing.T) {
+	server, _, ce, cfg := setupTestServer(t, "test-key")
+
+	initialYAML := "services:\n  redis:\n    image: redis:alpine\n"
+	_, err := ce.ProvisionStack(context.Background(), "cache", initialYAML)
+	if err != nil {
+		t.Fatalf("failed to provision: %v", err)
+	}
+
+	dryRunYAML := "services:\n  redis:\n    image: redis:7-alpine\n    ports:\n      - \"6379:6379\"\n"
+	body, _ := json.Marshal(map[string]any{
+		"compose": dryRunYAML,
+		"dryRun":  true,
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/projects/cache/compose", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-key")
+	w := httptest.NewRecorder()
+
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on dry run, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp APIResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	respMap, ok := resp.Data.(map[string]any)
+	if !ok || respMap["valid"] != true {
+		t.Fatalf("expected valid: true, got %v", resp.Data)
+	}
+
+	// Verify file on disk was NOT modified during dry run
+	saved, _ := os.ReadFile(filepath.Join(cfg.StacksDir, "cache", "compose.yml"))
+	if strings.Contains(string(saved), "redis:7-alpine") {
+		t.Errorf("file should not have been overwritten during dry run!")
+	}
+}
+
+func TestUpdateProjectCompose_InvalidYAML(t *testing.T) {
+	server, _, ce, _ := setupTestServer(t, "test-key")
+
+	_, _ = ce.ProvisionStack(context.Background(), "test-syntax", "services:\n  app:\n    image: app\n")
+
+	invalidYAML := "services:\n  invalid: [broken: {yaml"
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/projects/test-syntax/compose", strings.NewReader(invalidYAML))
+	req.Header.Set("X-API-Key", "test-key")
+	w := httptest.NewRecorder()
+
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestProjectYAMLAndFilesEndpoints(t *testing.T) {
+	server, _, ce, _ := setupTestServer(t, "test-key")
+
+	// 1. Provision stack
+	_, err := ce.ProvisionStack(context.Background(), "my-stack", "services:\n  web:\n    image: nginx\n")
+	if err != nil {
+		t.Fatalf("failed to provision: %v", err)
+	}
+
+	// 2. Add extra YAML file (config.yaml) and non-YAML file (notes.txt)
+	_ = ce.WriteProjectFile("my-stack", "config.yaml", "env: production\nworkers: 4\n")
+	_ = ce.WriteProjectFile("my-stack", "notes.txt", "some important notes")
+
+	// 3. GET /api/v1/projects/my-stack/yaml should list compose.yml and config.yaml
+	yamlListReq := httptest.NewRequest(http.MethodGet, "/api/v1/projects/my-stack/yaml", nil)
+	yamlListW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(yamlListW, yamlListReq)
+
+	if yamlListW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on list yaml, got %d: %s", yamlListW.Code, yamlListW.Body.String())
+	}
+
+	var yamlListResp APIResponse
+	_ = json.NewDecoder(yamlListW.Body).Decode(&yamlListResp)
+	yamlListData := yamlListResp.Data.(map[string]any)
+	filesList := yamlListData["files"].([]any)
+	if len(filesList) != 2 {
+		t.Errorf("expected 2 YAML files, got %d: %v", len(filesList), filesList)
+	}
+
+	// 4. GET /api/v1/projects/my-stack/yaml/config.yaml should read content
+	getYAMLReq := httptest.NewRequest(http.MethodGet, "/api/v1/projects/my-stack/yaml/config.yaml", nil)
+	getYAMLW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(getYAMLW, getYAMLReq)
+
+	if getYAMLW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on get yaml file, got %d: %s", getYAMLW.Code, getYAMLW.Body.String())
+	}
+
+	var getYAMLResp APIResponse
+	_ = json.NewDecoder(getYAMLW.Body).Decode(&getYAMLResp)
+	getYAMLData := getYAMLResp.Data.(map[string]any)
+	if !strings.Contains(getYAMLData["content"].(string), "workers: 4") {
+		t.Errorf("expected workers: 4 in content, got %v", getYAMLData["content"])
+	}
+
+	// 5. PUT /api/v1/projects/my-stack/yaml/config.yaml should update content
+	updatedYAMLContent := "env: production\nworkers: 8\n"
+	putYAMLReq := httptest.NewRequest(http.MethodPut, "/api/v1/projects/my-stack/yaml/config.yaml", strings.NewReader(updatedYAMLContent))
+	putYAMLReq.Header.Set("X-API-Key", "test-key")
+	putYAMLW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(putYAMLW, putYAMLReq)
+
+	if putYAMLW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on put yaml file, got %d: %s", putYAMLW.Code, putYAMLW.Body.String())
+	}
+
+	readBack, _ := ce.ReadProjectFile("my-stack", "config.yaml")
+	if !strings.Contains(readBack, "workers: 8") {
+		t.Errorf("expected workers: 8 in updated file, got:\n%s", readBack)
+	}
+
+	// 6. PUT /api/v1/projects/my-stack/yaml/config.yaml with invalid YAML syntax should fail with 422
+	badYAMLReq := httptest.NewRequest(http.MethodPut, "/api/v1/projects/my-stack/yaml/config.yaml", strings.NewReader("bad: [broken"))
+	badYAMLReq.Header.Set("X-API-Key", "test-key")
+	badYAMLW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(badYAMLW, badYAMLReq)
+
+	if badYAMLW.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 on bad yaml syntax, got %d: %s", badYAMLW.Code, badYAMLW.Body.String())
+	}
+
+	// 7. Path traversal attempts should be rejected with 400 Bad Request
+	traversalReq := httptest.NewRequest(http.MethodGet, "/api/v1/projects/my-stack/yaml/../secret.yaml", nil)
+	traversalW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(traversalW, traversalReq)
+
+	if traversalW.Code != http.StatusBadRequest && traversalW.Code != http.StatusNotFound && traversalW.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 400, 404, or 307 on path traversal, got %d: %s", traversalW.Code, traversalW.Body.String())
+	}
+
+	// 8. GET /api/v1/projects/my-stack/files should list all files with metadata
+	filesReq := httptest.NewRequest(http.MethodGet, "/api/v1/projects/my-stack/files", nil)
+	filesW := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(filesW, filesReq)
+
+	if filesW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on get files list, got %d: %s", filesW.Code, filesW.Body.String())
+	}
+
+	var filesResp APIResponse
+	_ = json.NewDecoder(filesW.Body).Decode(&filesResp)
+	filesData := filesResp.Data.(map[string]any)
+	itemsList := filesData["files"].([]any)
+	if len(itemsList) < 3 {
+		t.Errorf("expected at least 3 files (compose.yml, config.yaml, notes.txt), got %d", len(itemsList))
+	}
+}
+
+

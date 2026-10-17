@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/Harkole/fenrir-daemon/internal/metrics"
 	"github.com/Harkole/fenrir-daemon/internal/model"
 	"github.com/docker/docker/client"
+	"gopkg.in/yaml.v3"
 )
 
 // Handler holds dependencies for all API endpoints.
@@ -610,7 +612,7 @@ func (h *Handler) HandleCreateProject(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleGetProjectCompose retrieves the raw compose.yml content for a project.
+// HandleGetProjectCompose retrieves the raw compose content for a project along with its filename.
 func (h *Handler) HandleGetProjectCompose(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.PathValue("name"))
 	if name == "" {
@@ -623,19 +625,34 @@ func (h *Handler) HandleGetProjectCompose(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	content, err := h.composeEngine.ReadComposeFile(name)
+	filename, content, err := h.composeEngine.ReadComposeFileDetails(name)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "failed to read compose file: "+err.Error())
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
-		"project": name,
-		"compose": content,
+		"project":  name,
+		"filename": filename,
+		"compose":  content,
 	})
 }
 
-// HandleUpdateProjectCompose updates the compose.yml file after pre-flight validation and redeploys.
+// updateProjectPayload defines the accepted JSON body for editing/updating a project's YAML configuration.
+type updateProjectPayload struct {
+	Name           string  `json:"name"`
+	Compose        string  `json:"compose"`
+	YAML           string  `json:"yaml"`
+	Content        string  `json:"content"`
+	ComposeContent string  `json:"composeContent"`
+	Description    *string `json:"description"`
+	Redeploy       *bool   `json:"redeploy"`
+	Deploy         *bool   `json:"deploy"`
+	DryRun         *bool   `json:"dryRun"`
+	ValidateOnly   *bool   `json:"validateOnly"`
+}
+
+// HandleUpdateProjectCompose updates the compose YAML file after pre-flight validation and optionally redeploys.
 func (h *Handler) HandleUpdateProjectCompose(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.PathValue("name"))
 	if name == "" {
@@ -649,13 +666,28 @@ func (h *Handler) HandleUpdateProjectCompose(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	composeContent := string(bodyBytes)
-	var jsonPayload struct {
-		Name    string `json:"name"`
-		Compose string `json:"compose"`
+	var jsonPayload updateProjectPayload
+	isJSON := json.Unmarshal(bodyBytes, &jsonPayload) == nil
+
+	composeContent := ""
+	if isJSON {
+		if jsonPayload.Compose != "" {
+			composeContent = jsonPayload.Compose
+		} else if jsonPayload.YAML != "" {
+			composeContent = jsonPayload.YAML
+		} else if jsonPayload.Content != "" {
+			composeContent = jsonPayload.Content
+		} else if jsonPayload.ComposeContent != "" {
+			composeContent = jsonPayload.ComposeContent
+		}
 	}
-	if err := json.Unmarshal(bodyBytes, &jsonPayload); err == nil && jsonPayload.Compose != "" {
-		composeContent = jsonPayload.Compose
+
+	if composeContent == "" {
+		if isJSON {
+			writeError(w, http.StatusBadRequest, "request body must include 'compose', 'yaml', or 'content' field")
+			return
+		}
+		composeContent = string(bodyBytes)
 	}
 
 	composeContent = strings.TrimSpace(composeContent)
@@ -664,8 +696,36 @@ func (h *Handler) HandleUpdateProjectCompose(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Redeploy flag: defaults to true unless explicitly disabled via JSON or query parameter
+	redeploy := true
+	if jsonPayload.Redeploy != nil {
+		redeploy = *jsonPayload.Redeploy
+	} else if jsonPayload.Deploy != nil {
+		redeploy = *jsonPayload.Deploy
+	}
+	qRedeploy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("redeploy")))
+	qDeploy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("deploy")))
+	if qRedeploy == "false" || qRedeploy == "0" || qDeploy == "false" || qDeploy == "0" {
+		redeploy = false
+	} else if qRedeploy == "true" || qRedeploy == "1" || qDeploy == "true" || qDeploy == "1" {
+		redeploy = true
+	}
+
+	// Dry-run flag
+	dryRun := false
+	if jsonPayload.DryRun != nil && *jsonPayload.DryRun {
+		dryRun = true
+	} else if jsonPayload.ValidateOnly != nil && *jsonPayload.ValidateOnly {
+		dryRun = true
+	}
+	qDryRun := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("dry_run")))
+	qValidate := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("validate")))
+	if qDryRun == "true" || qDryRun == "1" || qValidate == "true" || qValidate == "1" {
+		dryRun = true
+	}
+
 	targetName := name
-	if jsonPayload.Name != "" {
+	if jsonPayload.Name != "" && compose.IsValidProjectName(jsonPayload.Name) {
 		targetName = jsonPayload.Name
 	}
 	sanitizedContainerName := compose.SanitizeContainerName(targetName)
@@ -715,40 +775,444 @@ func (h *Handler) HandleUpdateProjectCompose(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// Write updated compose.yml
+	if dryRun {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"project": name,
+			"valid":   true,
+			"message": "compose YAML configuration is valid and has no port conflicts",
+			"ports":   ports,
+		})
+		return
+	}
+
+	// Write updated compose YAML
 	provCtx, provCancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer provCancel()
 
-	_, err = h.composeEngine.ProvisionStack(provCtx, name, composeContent)
+	_, err = h.composeEngine.WriteComposeFile(provCtx, name, "", composeContent)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to write compose file: "+err.Error())
 		return
 	}
 
 	if h.db != nil {
-		_ = h.db.UpdateProjectStatus(r.Context(), name, "deploying")
+		existingProj, pErr := h.db.GetProject(r.Context(), name)
+		if pErr == nil && existingProj != nil {
+			if jsonPayload.Description != nil {
+				existingProj.Description = *jsonPayload.Description
+			}
+			if redeploy {
+				existingProj.Status = "deploying"
+			} else {
+				existingProj.Status = "updated"
+			}
+			_ = h.db.UpdateProject(r.Context(), existingProj)
+		} else {
+			desc := ""
+			if jsonPayload.Description != nil {
+				desc = *jsonPayload.Description
+			}
+			status := "updated"
+			if redeploy {
+				status = "deploying"
+			}
+			_ = h.db.CreateProject(r.Context(), &model.Project{
+				Name:          name,
+				DirectoryPath: filepath.Join(h.composeEngine.StacksDir(), name),
+				ComposeFile:   "compose.yml",
+				Description:   desc,
+				Status:        status,
+			})
+		}
 		_ = h.db.AllocateProjectPorts(r.Context(), name, ports)
 	}
 
-	// Trigger async redeployment
-	go func(projName string) {
-		deployCtx, deployCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer deployCancel()
+	if redeploy {
+		// Trigger async redeployment
+		go func(projName string) {
+			deployCtx, deployCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer deployCancel()
 
-		_, err := h.composeEngine.Up(deployCtx, projName)
-		if h.db != nil {
-			if err != nil {
-				_ = h.db.UpdateProjectStatus(context.Background(), projName, "failed")
-			} else {
-				_ = h.db.UpdateProjectStatus(context.Background(), projName, "running")
+			_, err := h.composeEngine.Up(deployCtx, projName)
+			if h.db != nil {
+				if err != nil {
+					_ = h.db.UpdateProjectStatus(context.Background(), projName, "failed")
+				} else {
+					_ = h.db.UpdateProjectStatus(context.Background(), projName, "running")
+				}
 			}
-		}
-	}(name)
+		}(name)
 
-	writeJSON(w, http.StatusAccepted, map[string]any{
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"project": name,
+			"status":  "deploying",
+			"message": "compose configuration updated successfully; redeployment initiated asynchronously",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
 		"project": name,
-		"status":  "deploying",
-		"message": "compose file updated and deployment initiated asynchronously",
+		"status":  "updated",
+		"message": "compose configuration updated successfully; redeployment not requested",
+	})
+}
+
+// HandleUpdateProject is an alias to HandleUpdateProjectCompose allowing clients to update projects via PUT /api/v1/projects/{name}.
+func (h *Handler) HandleUpdateProject(w http.ResponseWriter, r *http.Request) {
+	h.HandleUpdateProjectCompose(w, r)
+}
+
+// HandleListProjectYAML returns all YAML files present in the project directory.
+func (h *Handler) HandleListProjectYAML(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	files, err := h.composeEngine.ListProjectYAMLFiles(name)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "failed to list YAML files: "+err.Error())
+		return
+	}
+
+	activeCompose, _, _ := h.composeEngine.FindComposeFile(name)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project":       name,
+		"activeCompose": activeCompose,
+		"files":         files,
+	})
+}
+
+// HandleGetProjectYAMLFile retrieves the content of a specific YAML file in the project.
+func (h *Handler) HandleGetProjectYAMLFile(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	filename := strings.TrimSpace(r.PathValue("filename"))
+	if filename == "" {
+		writeError(w, http.StatusBadRequest, "filename is required")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	content, err := h.composeEngine.ReadProjectFile(name, filename)
+	if err != nil {
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "no such file") {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("file %q not found in project %q", filename, name))
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"project":  name,
+		"filename": filename,
+		"content":  content,
+	})
+}
+
+// HandleUpdateProjectYAMLFile updates an existing YAML file or creates a new one in the project directory.
+func (h *Handler) HandleUpdateProjectYAMLFile(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	filename := strings.TrimSpace(r.PathValue("filename"))
+	if filename == "" {
+		writeError(w, http.StatusBadRequest, "filename is required")
+		return
+	}
+
+	// If target file is a compose file, delegate to HandleUpdateProjectCompose
+	baseName := strings.ToLower(filepath.Base(filename))
+	isCompose := false
+	for _, cand := range compose.ComposeFileCandidates {
+		if baseName == cand {
+			isCompose = true
+			break
+		}
+	}
+	if isCompose {
+		h.HandleUpdateProjectCompose(w, r)
+		return
+	}
+
+	// Validate extension
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext != ".yml" && ext != ".yaml" {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid file extension %q: only .yml and .yaml files are supported", ext))
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	var jsonPayload struct {
+		YAML         string `json:"yaml"`
+		Content      string `json:"content"`
+		Restart      *bool  `json:"restart"`
+		DryRun       *bool  `json:"dryRun"`
+		ValidateOnly *bool  `json:"validateOnly"`
+	}
+
+	isJSON := json.Unmarshal(bodyBytes, &jsonPayload) == nil
+	yamlContent := ""
+	if isJSON {
+		if jsonPayload.YAML != "" {
+			yamlContent = jsonPayload.YAML
+		} else if jsonPayload.Content != "" {
+			yamlContent = jsonPayload.Content
+		}
+	}
+	if yamlContent == "" {
+		if isJSON {
+			writeError(w, http.StatusBadRequest, "request body must include 'yaml' or 'content' field")
+			return
+		}
+		yamlContent = string(bodyBytes)
+	}
+
+	yamlContent = strings.TrimSpace(yamlContent)
+	if yamlContent == "" {
+		writeError(w, http.StatusBadRequest, "YAML content cannot be empty")
+		return
+	}
+
+	// Validate YAML syntax
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(yamlContent), &root); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "invalid YAML syntax: "+err.Error())
+		return
+	}
+
+	// Check dry run
+	dryRun := false
+	if jsonPayload.DryRun != nil && *jsonPayload.DryRun {
+		dryRun = true
+	} else if jsonPayload.ValidateOnly != nil && *jsonPayload.ValidateOnly {
+		dryRun = true
+	}
+	qDryRun := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("dry_run")))
+	if qDryRun == "true" || qDryRun == "1" {
+		dryRun = true
+	}
+
+	if dryRun {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"project":  name,
+			"filename": filename,
+			"valid":    true,
+			"message":  "YAML syntax is valid",
+		})
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	if err := h.composeEngine.WriteProjectFile(name, filename, yamlContent); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Check if restart requested
+	restart := false
+	if jsonPayload.Restart != nil && *jsonPayload.Restart {
+		restart = true
+	}
+	qRestart := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("restart")))
+	if qRestart == "true" || qRestart == "1" {
+		restart = true
+	}
+
+	if restart {
+		go func(projName string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			_, _ = h.composeEngine.Restart(ctx, projName)
+		}(name)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project":   name,
+		"filename":  filename,
+		"restarted": restart,
+		"message":   "YAML file updated successfully",
+	})
+}
+
+// ProjectFileItem represents metadata about a file in a project directory.
+type ProjectFileItem struct {
+	Name       string `json:"name"`
+	IsDir      bool   `json:"isDir"`
+	SizeBytes  int64  `json:"sizeBytes,omitempty"`
+	IsYAML     bool   `json:"isYaml"`
+	ModifiedAt string `json:"modifiedAt,omitempty"`
+}
+
+// HandleListProjectFiles returns metadata for all files in a project directory.
+func (h *Handler) HandleListProjectFiles(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	projectDir, err := h.composeEngine.ProjectPath(name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "failed to read project directory: "+err.Error())
+		return
+	}
+
+	var items []ProjectFileItem
+	for _, entry := range entries {
+		info, iErr := entry.Info()
+		size := int64(0)
+		modTime := ""
+		if iErr == nil {
+			size = info.Size()
+			modTime = info.ModTime().UTC().Format(time.RFC3339)
+		}
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		isYaml := !entry.IsDir() && (ext == ".yml" || ext == ".yaml")
+
+		items = append(items, ProjectFileItem{
+			Name:       entry.Name(),
+			IsDir:      entry.IsDir(),
+			SizeBytes:  size,
+			IsYAML:     isYaml,
+			ModifiedAt: modTime,
+		})
+	}
+
+	if items == nil {
+		items = []ProjectFileItem{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project": name,
+		"files":   items,
+	})
+}
+
+// HandleGetProjectFile reads and returns the raw content of any file in the project directory.
+func (h *Handler) HandleGetProjectFile(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	filename := strings.TrimSpace(r.PathValue("filename"))
+	if filename == "" {
+		writeError(w, http.StatusBadRequest, "filename is required")
+		return
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	content, err := h.composeEngine.ReadProjectFile(name, filename)
+	if err != nil {
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "no such file") {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("file %q not found in project %q", filename, name))
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"project":  name,
+		"filename": filename,
+		"content":  content,
+	})
+}
+
+// HandleUpdateProjectFile updates any file in the project directory.
+func (h *Handler) HandleUpdateProjectFile(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "project name is required")
+		return
+	}
+
+	filename := strings.TrimSpace(r.PathValue("filename"))
+	if filename == "" {
+		writeError(w, http.StatusBadRequest, "filename is required")
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext == ".yml" || ext == ".yaml" {
+		h.HandleUpdateProjectYAMLFile(w, r)
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	content := string(bodyBytes)
+	var jsonPayload struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(bodyBytes, &jsonPayload); err == nil && jsonPayload.Content != "" {
+		content = jsonPayload.Content
+	}
+
+	if h.composeEngine == nil {
+		writeError(w, http.StatusServiceUnavailable, "compose engine not configured")
+		return
+	}
+
+	if err := h.composeEngine.WriteProjectFile(name, filename, content); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project":  name,
+		"filename": filename,
+		"message":  "file updated successfully",
 	})
 }
 

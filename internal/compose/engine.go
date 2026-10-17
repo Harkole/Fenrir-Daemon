@@ -13,9 +13,13 @@ import (
 	"strings"
 
 	"github.com/Harkole/fenrir-daemon/internal/model"
+	"gopkg.in/yaml.v3"
 )
 
 var validProjectNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
+// ComposeFileCandidates lists candidate filenames for docker compose files in order of preference.
+var ComposeFileCandidates = []string{"compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"}
 
 // IsValidProjectName checks whether the given project name contains only allowed characters.
 func IsValidProjectName(name string) bool {
@@ -108,7 +112,11 @@ func (e *Engine) ValidateCompose(ctx context.Context, rawYaml string) (string, e
 		// If docker binary is not installed / mock environment
 		if errors.Is(err, exec.ErrNotFound) {
 			// Basic YAML syntax fallback validation when Docker CLI is not present
-			return "docker cli not found; passed basic non-empty check", nil
+			var node yaml.Node
+			if uErr := yaml.Unmarshal([]byte(rawYaml), &node); uErr != nil {
+				return "", fmt.Errorf("pre-flight validation failed: invalid YAML syntax: %w", uErr)
+			}
+			return "docker cli not found; passed basic YAML syntax check", nil
 		}
 		errMsg := strings.TrimSpace(stderr.String())
 		if errMsg == "" {
@@ -123,11 +131,44 @@ func (e *Engine) ValidateCompose(ctx context.Context, rawYaml string) (string, e
 	return stdout.String(), nil
 }
 
+// FindComposeFile searches for an existing compose file in the project directory.
+// Returns the filename (e.g. "compose.yml" or "docker-compose.yml"), absolute path, or an error.
+func (e *Engine) FindComposeFile(name string) (string, string, error) {
+	projectDir, err := e.ProjectPath(name)
+	if err != nil {
+		return "", "", err
+	}
+
+	for _, cand := range ComposeFileCandidates {
+		p := filepath.Join(projectDir, cand)
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return cand, p, nil
+		}
+	}
+
+	return "compose.yml", filepath.Join(projectDir, "compose.yml"), os.ErrNotExist
+}
+
 // ProvisionStack creates the stack directory structure (`data/` directory and `compose.yml`).
 func (e *Engine) ProvisionStack(ctx context.Context, name, rawYaml string) (string, error) {
+	return e.WriteComposeFile(ctx, name, "compose.yml", rawYaml)
+}
+
+// WriteComposeFile writes the compose YAML to a project directory using atomic rename
+// and enforces container user permissions (UID/GID 1000).
+func (e *Engine) WriteComposeFile(ctx context.Context, name, filename, rawYaml string) (string, error) {
 	projectDir, err := e.ProjectPath(name)
 	if err != nil {
 		return "", err
+	}
+
+	filename = strings.TrimSpace(filename)
+	if filename == "" {
+		if existing, _, err := e.FindComposeFile(name); err == nil {
+			filename = existing
+		} else {
+			filename = "compose.yml"
+		}
 	}
 
 	// 1. Create project root directory
@@ -141,9 +182,9 @@ func (e *Engine) ProvisionStack(ctx context.Context, name, rawYaml string) (stri
 		return "", fmt.Errorf("failed to create project data directory %q: %w", dataDir, err)
 	}
 
-	// 3. Write compose.yml safely using atomic rename
-	composePath := filepath.Join(projectDir, "compose.yml")
-	tmpFile := filepath.Join(projectDir, ".compose.yml.tmp")
+	// 3. Write compose YAML safely using atomic rename
+	composePath := filepath.Join(projectDir, filename)
+	tmpFile := filepath.Join(projectDir, fmt.Sprintf(".%s.tmp", filename))
 
 	if err := os.WriteFile(tmpFile, []byte(rawYaml), 0644); err != nil {
 		return "", fmt.Errorf("failed to write temporary compose file: %w", err)
@@ -151,7 +192,7 @@ func (e *Engine) ProvisionStack(ctx context.Context, name, rawYaml string) (stri
 
 	if err := os.Rename(tmpFile, composePath); err != nil {
 		_ = os.Remove(tmpFile)
-		return "", fmt.Errorf("failed to commit compose.yml: %w", err)
+		return "", fmt.Errorf("failed to commit %s: %w", filename, err)
 	}
 
 	// 4. Ensure recursive permissions and ownership for container users (UID/GID 1000)
@@ -162,20 +203,120 @@ func (e *Engine) ProvisionStack(ctx context.Context, name, rawYaml string) (stri
 	return projectDir, nil
 }
 
-// ReadComposeFile reads the content of compose.yml from a project directory.
+// ReadComposeFile reads the content of compose.yml (or existing compose file candidate) from a project directory.
 func (e *Engine) ReadComposeFile(name string) (string, error) {
+	_, content, err := e.ReadComposeFileDetails(name)
+	return content, err
+}
+
+// ReadComposeFileDetails reads the compose file and returns both filename and content.
+func (e *Engine) ReadComposeFileDetails(name string) (string, string, error) {
+	filename, composePath, err := e.FindComposeFile(name)
+	if err != nil && !os.IsNotExist(err) {
+		return "", "", err
+	}
+
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read compose file: %w", err)
+	}
+
+	return filename, string(data), nil
+}
+
+// ResolveProjectFilePath verifies that relativePath is securely located inside the project directory.
+func (e *Engine) ResolveProjectFilePath(name, relativePath string) (string, error) {
 	projectDir, err := e.ProjectPath(name)
 	if err != nil {
 		return "", err
 	}
 
-	composePath := filepath.Join(projectDir, "compose.yml")
-	data, err := os.ReadFile(composePath)
+	cleanRel := filepath.Clean(relativePath)
+	if strings.HasPrefix(cleanRel, "..") || filepath.IsAbs(cleanRel) || filepath.IsAbs(relativePath) ||
+		strings.HasPrefix(relativePath, "/") || strings.HasPrefix(relativePath, "\\") ||
+		strings.HasPrefix(cleanRel, "/") || strings.HasPrefix(cleanRel, "\\") {
+		return "", fmt.Errorf("invalid path %q: directory traversal is forbidden", relativePath)
+	}
+
+	fullPath := filepath.Join(projectDir, cleanRel)
+	rel, err := filepath.Rel(projectDir, fullPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("invalid path %q: path escapes project directory", relativePath)
+	}
+
+	return fullPath, nil
+}
+
+// ListProjectYAMLFiles returns a list of all YAML files found in the project root.
+func (e *Engine) ListProjectYAMLFiles(name string) ([]string, error) {
+	projectDir, err := e.ProjectPath(name)
 	if err != nil {
-		return "", fmt.Errorf("failed to read compose file: %w", err)
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read project directory: %w", err)
+	}
+
+	var yamlFiles []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if ext == ".yml" || ext == ".yaml" {
+			yamlFiles = append(yamlFiles, entry.Name())
+		}
+	}
+
+	if yamlFiles == nil {
+		yamlFiles = []string{}
+	}
+
+	return yamlFiles, nil
+}
+
+// ReadProjectFile reads any file within the project directory safely.
+func (e *Engine) ReadProjectFile(name, relativePath string) (string, error) {
+	fullPath, err := e.ResolveProjectFilePath(name, relativePath)
+	if err != nil {
+		return "", err
+	}
+
+	data, err := os.ReadFile(fullPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read project file %q: %w", relativePath, err)
 	}
 
 	return string(data), nil
+}
+
+// WriteProjectFile writes any file within the project directory safely using atomic rename.
+func (e *Engine) WriteProjectFile(name, relativePath, content string) error {
+	fullPath, err := e.ResolveProjectFilePath(name, relativePath)
+	if err != nil {
+		return err
+	}
+
+	parentDir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory for %q: %w", relativePath, err)
+	}
+
+	tmpFile := filepath.Join(parentDir, fmt.Sprintf(".%s.tmp", filepath.Base(fullPath)))
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to write temporary file: %w", err)
+	}
+
+	if err := os.Rename(tmpFile, fullPath); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to commit file %q: %w", relativePath, err)
+	}
+
+	projectDir, _ := e.ProjectPath(name)
+	_ = SetStackPermissions(projectDir, e.defaultUID, e.defaultGID)
+	return nil
 }
 
 // ListProjectFiles inspects the project directory and returns a list of files and whether data/ exists.

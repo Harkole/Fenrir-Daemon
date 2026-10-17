@@ -58,8 +58,26 @@ func NewServer(cfg *config.Config, dm *docker.Monitor, hc *metrics.HostCollector
 	mux.HandleFunc("GET /api/v1/ports", h.HandleListActivePorts)
 	mux.Handle("POST /api/v1/projects", auth(http.HandlerFunc(h.HandleCreateProject)))
 	mux.HandleFunc("GET /api/v1/projects/{name}", h.HandleGetProject)
+	mux.Handle("PUT /api/v1/projects/{name}", auth(http.HandlerFunc(h.HandleUpdateProject)))
+	mux.Handle("PATCH /api/v1/projects/{name}", auth(http.HandlerFunc(h.HandleUpdateProject)))
 	mux.HandleFunc("GET /api/v1/projects/{name}/compose", h.HandleGetProjectCompose)
 	mux.Handle("PUT /api/v1/projects/{name}/compose", auth(http.HandlerFunc(h.HandleUpdateProjectCompose)))
+	mux.Handle("PATCH /api/v1/projects/{name}/compose", auth(http.HandlerFunc(h.HandleUpdateProjectCompose)))
+	mux.Handle("POST /api/v1/projects/{name}/compose", auth(http.HandlerFunc(h.HandleUpdateProjectCompose)))
+
+	// Multi-YAML file management and editing endpoints
+	mux.HandleFunc("GET /api/v1/projects/{name}/yaml", h.HandleListProjectYAML)
+	mux.HandleFunc("GET /api/v1/projects/{name}/yaml/{filename...}", h.HandleGetProjectYAMLFile)
+	mux.Handle("PUT /api/v1/projects/{name}/yaml/{filename...}", auth(http.HandlerFunc(h.HandleUpdateProjectYAMLFile)))
+	mux.Handle("PATCH /api/v1/projects/{name}/yaml/{filename...}", auth(http.HandlerFunc(h.HandleUpdateProjectYAMLFile)))
+	mux.Handle("POST /api/v1/projects/{name}/yaml/{filename...}", auth(http.HandlerFunc(h.HandleUpdateProjectYAMLFile)))
+
+	// Project directory file inspection and editing endpoints
+	mux.HandleFunc("GET /api/v1/projects/{name}/files", h.HandleListProjectFiles)
+	mux.HandleFunc("GET /api/v1/projects/{name}/files/{filename...}", h.HandleGetProjectFile)
+	mux.Handle("PUT /api/v1/projects/{name}/files/{filename...}", auth(http.HandlerFunc(h.HandleUpdateProjectFile)))
+	mux.Handle("PATCH /api/v1/projects/{name}/files/{filename...}", auth(http.HandlerFunc(h.HandleUpdateProjectFile)))
+
 	mux.Handle("POST /api/v1/projects/{name}/up", auth(http.HandlerFunc(h.HandleProjectUp)))
 	mux.Handle("POST /api/v1/projects/{name}/down", auth(http.HandlerFunc(h.HandleProjectDown)))
 	mux.Handle("POST /api/v1/projects/{name}/restart", auth(http.HandlerFunc(h.HandleProjectRestart)))
