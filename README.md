@@ -137,8 +137,18 @@ Protected by API Key authentication:
   - **Active Port Collision Tracking & Validation**: Parses host ports defined in the incoming `compose.yml` (supporting short and long YAML syntax and port ranges) and validates against active stacks in SQLite. If a host port is already bound, returns `400 Bad Request` with collision details (`port conflict: host port 25565/tcp is already allocated to project "atm10"`), aborting before any files or directories are created on disk.
   - **UID 1000 Container Permissions**: Recursively sets ownership and directory (`0775`) / file (`0664`) permissions across the stack directory and `data/` volume to match standard container user expectations (UID/GID 1000 or `FENRIR_DEFAULT_UID`/`GID`), preventing Java/Minecraft startup "Permission denied" errors.
 - **`GET /api/v1/projects/{name}`**: Get stack details, files list, data directory presence, compose content, and allocated host ports.
-- **`GET /api/v1/projects/{name}/compose`**: Read raw `compose.yml` content.
-- **`PUT /api/v1/projects/{name}/compose`** *(Auth Required)*: Update `compose.yml` with pre-flight syntax and port collision validation before async redeployment.
+- **`PUT /api/v1/projects/{name}`** & **`PATCH /api/v1/projects/{name}`** *(Auth Required)*: Update an existing project's compose YAML and metadata.
+- **`GET /api/v1/projects/{name}/compose`**: Read raw compose YAML content (auto-detects `compose.yml`, `compose.yaml`, `docker-compose.yml`, `docker-compose.yaml`).
+- **`PUT /api/v1/projects/{name}/compose`** *(Auth Required)*: Update compose YAML with pre-flight syntax and port collision validation. Also supports `PATCH` and `POST`.
+  - **Flexible Payloads**: Accepts raw YAML or JSON body with `compose`, `yaml`, `content`, or `composeContent` fields, along with optional `description`.
+  - **Save Without Redeploying**: Supply `redeploy=false` or `deploy=false` (in JSON body or query param `?redeploy=false`) to commit edits and update port allocations without triggering container startup/restart.
+  - **Pre-flight Dry Run**: Supply `dry_run=true` or `validate=true` (in JSON body or query param `?dry_run=true`) to validate compose syntax and port allocations without writing to disk.
+- **`GET /api/v1/projects/{name}/yaml`**: List all YAML files (`.yml` and `.yaml`) in the stack directory and identify the active compose file.
+- **`GET /api/v1/projects/{name}/yaml/{filename}`**: Read the content of any YAML file within the stack directory.
+- **`PUT /api/v1/projects/{name}/yaml/{filename}`** *(Auth Required)*: Update an existing YAML file (e.g. `config.yaml`, `settings.yml`) with strict YAML syntax validation, atomic rename, and container permissions (UID/GID 1000). Also supports optional `?restart=true` to restart stack services. If target is a compose file, delegates to pre-flight compose and port validation.
+- **`GET /api/v1/projects/{name}/files`**: List all files and directories in the stack with sizes, modification timestamps, and YAML indicators.
+- **`GET /api/v1/projects/{name}/files/{filename}`**: Retrieve raw content of any file within the project directory.
+- **`PUT /api/v1/projects/{name}/files/{filename}`** *(Auth Required)*: Update any file in the project directory with atomic commit and directory traversal protection.
 - **`POST /api/v1/projects/{name}/up`** *(Auth Required)*: Execute `docker compose up -d` with port conflict validation.
 - **`POST /api/v1/projects/{name}/down`** *(Auth Required)*: Execute `docker compose down`, immediately freeing allocated ports in SQLite.
 - **`POST /api/v1/projects/{name}/restart`** *(Auth Required)*: Execute `docker compose restart`.
